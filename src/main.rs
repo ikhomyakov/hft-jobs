@@ -1,5 +1,15 @@
 use std::{mem, ptr, sync::mpsc, thread};
 
+#[macro_export]
+macro_rules! log {
+    ($tx:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
+        let job = Job::new(move || {
+            println!($fmt $(, $arg)*);
+        });
+        let _ = $tx.send(job);
+    }};
+}
+
 const JOB_DATA_SIZE: usize = 64; // tweak: must be >= sizeof(biggest closure)
 
 #[repr(align(16))]
@@ -73,42 +83,29 @@ fn main() {
     });
 
     // "Hot" thread: create a job and move it through the channel
-    let job1 = Job::new(move || {
-        println!("Hello, world!");
-    });
+    log!(tx, "Hello, world!");
 
     let price = 123_i64;
     let size = 10_u128;
     let symbol = "SWPPX";
-
-    let job2 = Job::new(move || {
-        eprintln!("trade: symbol={}, price={} size={}", symbol, price, size);
-    });
+    log!(tx, "trade: symbol={}, price={} size={}", symbol, price, size);
 
     let a = String::from("Hello");
     let b = String::from("world");
     let c: u128 = 42;
-    let job3 = Job::new(move || {
-        println!("{}, {}! {}", a, b, c);
-    });
+    log!(tx, "{}, {}! {}", a, b, c);
 
     let vs = vec![1, 2, 3];
     let closure1 = move || {
         println!("Hello, vec {:?}!", vs);
     };
-
     dbg!(mem::size_of_val(&closure1));
-    
 
     let job4 = Job::new(move || {
         closure1();
         closure1();
     });
 
-    // Move the jobs into the background thread
-    tx.send(job1).unwrap();
-    tx.send(job2).unwrap();
-    tx.send(job3).unwrap();
     tx.send(job4).unwrap();
 
     drop(tx);
