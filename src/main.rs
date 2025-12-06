@@ -22,7 +22,7 @@ struct Job<const N: usize = 64> {
 }
 
 // SAFETY: Job only ever contains F: FnOnce() + Send + 'static, enforced in Job::new.
-unsafe impl Send for Job {}
+unsafe impl<const N: usize> Send for Job<N> {}
 
 impl<const N: usize> Job<N> {
     fn new<F>(f: F) -> Self
@@ -187,4 +187,191 @@ fn main() {
 
     drop(tx);
     worker.join().unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+
+    /// Helper: prove at compile time that Job is Send.
+    fn assert_send<T: Send>() {}
+    #[test]
+    fn job_is_send() {
+        assert_send::<Job>();
+        assert_send::<Job<128>>();
+    }
+
+    #[test]
+    fn job_runs_closure_once() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = {
+            let counter = counter.clone();
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+
+        let job: Job = Job::new(c);
+        job.run();
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cloned_jobs_both_run() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = {
+            let counter = counter.clone();
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+
+        let job1: Job = Job::new(c);
+        let job2 = job1.clone();
+
+        job1.run();
+        job2.run();
+
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    /// Type whose Drop increments a shared AtomicUsize.
+    #[derive(Clone)]
+    struct DropGuard {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropGuard {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn job_drop_calls_closure_drop_when_not_run() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let guard = DropGuard {
+                drops: drops.clone(),
+            };
+            let c = move || {
+                // Do nothing; we only care about Drop.
+                let _ = &guard;
+            };
+            let _job: Job = Job::new(c);
+            // _job is dropped here without run()
+        }
+
+        // The closure's captured DropGuard should have been dropped exactly once.
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn job_run_does_not_double_drop_closure() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let guard = DropGuard {
+                drops: drops.clone(),
+            };
+            let c = move || {
+                // When this closure is called, its captured guard will
+                // be dropped at end of call.
+                let _ = &guard;
+            };
+            let job: Job = Job::new(c);
+            job.run();
+            // After run(), Job's Drop should not try to drop the original F again.
+        }
+
+        // Exactly one drop of the captured guard.
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to execute an empty job")]
+    fn default_job_panics_on_run() {
+        let job: Job = Job::default();
+        job.run();
+    }
+
+    #[test]
+    #[should_panic]
+    fn job_new_panics_if_closure_too_big() {
+        // Capture a big array by value so the closure is larger than N=64 bytes.
+        let big = [0u8; 128];
+        let c = move || {
+            let _ = &big;
+        };
+
+        // This should panic on the size assertion inside Job::new::<F, 64>.
+        let _job: Job<64> = Job::new(c);
+        let _ = _job;
+    }
+
+    #[test]
+    fn log_macro_sends_job_over_channel() {
+        let (tx, rx) = mpsc::channel::<Job>();
+
+        log!(tx, "hello from log macro");
+        let job = rx.recv().expect("expected a Job from log! macro");
+
+        // If this runs without panic, we’re good enough here.
+        job.run();
+    }
+
+    #[test]
+    fn job_can_be_sent_to_worker_thread_and_run() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel::<Job<1024>>();
+
+        // Worker thread that receives and runs jobs.
+        let worker_counter = counter.clone();
+        let worker = thread::spawn(move || {
+            while let Ok(job) = rx.recv() {
+                job.run();
+                worker_counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        // Send a few jobs.
+        for _ in 0..3 {
+            let c_counter = counter.clone();
+            let job = Job::new(move || {
+                c_counter.fetch_add(1, Ordering::SeqCst);
+            });
+            tx.send(job).unwrap();
+        }
+
+        drop(tx); // close channel
+        worker.join().unwrap();
+
+        // 3 jobs executed, and worker ran loop 3 times.
+        assert_eq!(counter.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn job_alignment_and_size_are_sufficient_for_small_closure() {
+        // Small closure capturing a couple of integers.
+        let a = 1u32;
+        let b = 2u64;
+        let c = move || {
+            let _ = a + b as u32;
+        };
+
+        let size_f = mem::size_of_val(&c);
+        let align_f = mem::align_of_val(&c);
+
+        assert!(size_f <= 64);
+        assert!(align_f <= mem::align_of::<Align16<[u8; 64]>>());
+
+        // Should not panic:
+        let job: Job = Job::new(c);
+        job.run();
+    }
 }
