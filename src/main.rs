@@ -17,6 +17,7 @@ struct Align16<T>(pub T);
 struct Job<const N: usize = 64> {
     data: Align16<[u8; N]>, // N must be >= sizeof(biggest closure)
     fn_call: unsafe fn(*mut u8),
+    fn_clone: unsafe fn(*const u8, *mut u8),
     fn_drop: unsafe fn(*mut u8),
 }
 
@@ -26,11 +27,11 @@ unsafe impl Send for Job {}
 impl<const N: usize> Job<N> {
     fn new<F>(f: F) -> Self
     where
-        F: FnOnce() + Send + 'static,
+        F: FnOnce() + Clone + Send + 'static,
     {
-        dbg!(mem::size_of::<F>());
-        dbg!(mem::align_of::<F>());
-        dbg!(mem::align_of::<Align16<[u8; N]>>());
+        // dbg!(mem::size_of::<F>());
+        // dbg!(mem::align_of::<F>());
+        // dbg!(mem::align_of::<Align16<[u8; N]>>());
 
         // Ensure the closure fits into our inline storage
         assert!(mem::size_of::<F>() <= N);
@@ -45,6 +46,17 @@ impl<const N: usize> Job<N> {
             }
         }
 
+        unsafe fn fn_clone<F>(src: *const u8, dst: *mut u8)
+        where
+            F: FnOnce() + Clone,
+        {
+            unsafe {
+                let f_src = &*(src as *const F);
+                let f_clone = f_src.clone();
+                ptr::write(dst as *mut F, f_clone);
+            }
+        }
+
         unsafe fn fn_drop<F: FnOnce()>(data: *mut u8) {
             unsafe {
                 ptr::drop_in_place(data as *mut F);
@@ -53,6 +65,7 @@ impl<const N: usize> Job<N> {
 
         let mut job = Job {
             fn_call: fn_call::<F>,
+            fn_clone: fn_clone::<F>,
             fn_drop: fn_drop::<F>,
             data: Align16([0u8; N]),
         };
@@ -80,6 +93,24 @@ impl<const N: usize> Default for Job<N> {
     }
 }
 
+impl<const N: usize> Clone for Job<N> {
+    fn clone(&self) -> Self {
+        let mut new_job = Job {
+            fn_call: self.fn_call,
+            fn_clone: self.fn_clone,
+            fn_drop: self.fn_drop,
+            data: Align16([0u8; N]),
+        };
+        unsafe {
+            (self.fn_clone)(
+                self.data.0.as_ptr() as *const u8,
+                new_job.data.0.as_mut_ptr() as *mut u8,
+            );
+        }
+        new_job
+    }
+}
+
 impl<const N: usize> Drop for Job<N> {
     fn drop(&mut self) {
         unsafe {
@@ -88,7 +119,7 @@ impl<const N: usize> Drop for Job<N> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct X;
 
 impl Drop for X {
@@ -130,11 +161,22 @@ fn main() {
     let c: u128 = 42;
     log!(tx, "{}, {}! {}", a, b, c);
 
-    let vs = vec![1, 2, 3];
-    let closure1 = move || {
-        println!("Hello, vec {:?}!", dbg!(vs));
+    let mut vs = vec![1, 2, 3];
+    let mut closure1 = move || {
+        vs.push(vs.last().unwrap().clone() + 1);
+        println!("Hello, vec {:?}!", vs);
     };
+
     dbg!(mem::size_of_val(&closure1));
+
+    closure1();
+    closure1();
+
+    let job3: Job = Job::new(closure1.clone());
+    dbg!(mem::size_of_val(&job3));
+
+    job3.clone().run();
+    job3.run();
 
     let job4 = Job::new(move || {
         closure1.clone()();
