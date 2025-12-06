@@ -1,5 +1,77 @@
-use std::{mem, ptr, sync::mpsc, thread};
+//! A lightweight, allocation-free job system for executing type-erased closures.
+//!
+//! This crate provides the [`Job`] type and helpers (such as the [`log!`] macro)
+//! for storing closures inline in a fixed-size buffer and dispatching them
+//! through worker threads or job queues. Each job carries its own `call`,
+//! `clone`, and `drop` logic via function pointers, allowing predictable,
+//! allocation-free execution.
+//!
+//! # Example: Running Jobs on a Worker Thread
+//!
+//! ```rust
+//! use std::sync::mpsc;
+//! use std::thread;
+//! use hft_logger::{Job, log};
+//!
+//! // Create a channel for sending jobs
+//! let (tx, rx) = mpsc::channel::<Job>();
+//!
+//! // Spawn a worker thread that receives and runs jobs
+//! thread::spawn(move || {
+//!     while let Ok(job) = rx.recv() {
+//!         job.run();
+//!     }
+//! });
+//!
+//! // Send a simple job
+//! let job = Job::<64>::new(|| println!("Hello from a job!"));
+//! tx.send(job).unwrap();
+//!
+//! // Or use the `log!` macro to enqueue a println job
+//! log!(tx, "Logging from thread: {}", 42);
+//! ```
+//!
+//! This model provides a minimal, fast job runtime suitable for embedded
+//! systems, schedulers, executors, or lightweight logging systems.
+use std::{mem, ptr};
 
+/// Asynchronously logs a formatted message by sending a `Job` containing a
+/// `println!` invocation over the provided sender.
+///
+/// # Overview
+/// The `log!` macro constructs a `Job` that, when executed, prints a formatted
+/// message to stdout. Instead of performing I/O immediately, the macro sends
+/// the job through the given channel, allowing logging to occur on a separate
+/// worker thread.
+///
+/// # Parameters
+/// - `tx`: A sender capable of sending `Job` instances (e.g. `std::sync::mpsc::Sender<Job>`).
+/// - `fmt`: A string literal used as the format string for `println!`.
+/// - `args`: Optional additional expressions used to fill formatting placeholders.
+///
+/// The macro accepts an optional trailing comma.
+///
+/// # Behavior
+/// - A closure is created that runs `println!(fmt, args...)`.
+/// - This closure is wrapped in a `Job` via `Job::new`.
+/// - The resulting job is sent through `tx`.
+/// - Any error returned by `send` is ignored.
+///
+/// # Example
+/// ```
+/// # use std::sync::mpsc::channel;
+/// # use hft_logger::{log, Job};
+/// let (tx, rx) = channel::<Job>();
+///
+/// // Spawn a worker thread to run jobs.
+/// std::thread::spawn(move || {
+///     while let Ok(job) = rx.recv() {
+///         job.run();
+///     }
+/// });
+///
+/// log!(tx, "User {} logged in from {}", "alice", "127.0.0.1");
+/// ```
 #[macro_export]
 macro_rules! log {
     ($tx:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
@@ -13,6 +85,64 @@ macro_rules! log {
 #[repr(align(16))]
 struct Align16<T>(pub T);
 
+/// A type-erased, fixed-size job container for storing and invoking closures.
+///
+/// `Job` holds an opaque buffer and a trio of function pointers that know how
+/// to call, clone, and drop the stored value. This allows arbitrary closures
+/// (or other callable types) to be stored in a uniform, `repr(C)` layout,
+/// making it suitable for job queues, thread pools, and FFI boundaries.
+///
+/// The stored callable is expected to live entirely inside the `data` buffer,
+/// and the function pointers must treat that buffer as their backing storage.
+///
+/// # Type Parameters
+///
+/// * `N` – The size of the internal storage buffer, in bytes. This must be
+///   large enough to hold the largest closure (or callable) you intend to
+///   store. The default is `64`.
+///
+/// # Layout
+///
+/// * `data` – An `Align16<[u8; N]>` buffer that stores the erased closure.
+///   The alignment wrapper ensures the buffer has at least 16-byte alignment,
+///   which is typically sufficient for most captured types.
+/// * `fn_call` – An `unsafe fn(*mut u8)` that takes a pointer into `data` and
+///   invokes the stored callable.
+/// * `fn_clone` – An `unsafe fn(*const u8, *mut u8)` that clones the stored
+///   value from one buffer to another (source and destination pointers into
+///   `data`-like storage).
+/// * `fn_drop` – An `unsafe fn(*mut u8)` that drops the stored value in place.
+///
+/// The `repr(C)` attribute guarantees a stable field layout, which is useful if
+/// instances of `Job` are passed across FFI or need a predictable memory
+/// representation.
+///
+/// # Safety
+///
+/// This type is fundamentally unsafe to construct manually:
+///
+/// * The function pointers **must** be consistent with the actual type stored
+///   inside `data`.
+/// * The `fn_call`, `fn_clone`, and `fn_drop` implementations must only read
+///   and write within the `N`-byte buffer.
+/// * `N` must be at least `size_of::<T>()` for the stored type `T`, and the
+///   alignment provided by `Align16` must be sufficient for `T`.
+///
+/// Incorrect construction or misuse may lead to undefined behavior. Safe APIs
+/// (such as `Job::new`, `Job::run`, etc.) should enforce these invariants.
+///
+/// # Example
+///
+/// ```rust
+/// # use hft_logger::Job;
+/// // Typically constructed via a helper like `Job::new`:
+/// let job = Job::<64>::new(|| {
+///     println!("Hello from a job!");
+/// });
+///
+/// // Later, the job executor would call something like:
+/// job.run();
+/// ```
 #[repr(C)]
 pub struct Job<const N: usize = 64> {
     data: Align16<[u8; N]>, // N must be >= sizeof(biggest closure)
@@ -25,6 +155,49 @@ pub struct Job<const N: usize = 64> {
 unsafe impl<const N: usize> Send for Job<N> {}
 
 impl<const N: usize> Job<N> {
+    /// Creates a new job from a closure, storing it inline without heap
+    /// allocation.
+    ///
+    /// # Type Requirements
+    /// The closure `F` must satisfy:
+    /// - `FnOnce()`
+    /// - `Clone` — needed so the job queue or scheduler can duplicate jobs if
+    ///   desired.
+    /// - `Send` + 'static — ensures the closure may be transferred across threads.
+    ///
+    /// # Storage Constraints
+    /// The closure must fit inside the inline buffer:
+    /// - `size_of::<F>() <= N`
+    /// - `align_of::<F>() <= align_of::<Align16<[u8; N]>>`
+    ///
+    /// If either condition fails, the function **panics**.
+    ///
+    /// # How it Works
+    ///
+    /// This method:
+    /// 1. Generates specialized `fn_call`, `fn_clone`, and `fn_drop` functions
+    ///    for the captured closure type `F`.
+    /// 2. Writes the closure directly into the inline buffer using
+    ///    `ptr::write`, avoiding heap allocations.
+    /// 3. Returns a fully-constructed `Job` that owns the closure.
+    ///
+    /// # Safety
+    ///
+    /// Internally uses unsafe operations to:
+    /// - Reconstruct `F` from raw bytes.
+    /// - Clone `F` via raw pointers.
+    /// - Drop `F` in place.
+    ///
+    /// These operations are memory-safe *only* because:
+    /// - The size and alignment checks guarantee the buffer is valid for `F`.
+    /// - The caller cannot violate the type invariants through the public API.
+    ///
+    /// # Example
+    /// ```
+    /// # use hft_logger::Job;
+    /// let job = Job::<64>::new(|| println!("Hello from a job!"));
+    /// // The job is now a self-contained, type-erased closure.
+    /// ```
     pub fn new<F>(f: F) -> Self
     where
         F: FnOnce() + Clone + Send + 'static,
@@ -79,6 +252,31 @@ impl<const N: usize> Job<N> {
         job
     }
 
+    /// Runs the stored closure, consuming the job.
+    ///
+    /// This invokes the closure that was previously stored in the inline buffer.
+    /// After invocation, the job's drop function pointer is reset to the default
+    /// `fn_drop`, preventing the closure from being dropped **twice**.
+    ///
+    /// # How it Works
+    /// - `fn_call` takes ownership of the closure by reading it out of the buffer.
+    /// - The closure is executed.
+    /// - The job updates `fn_drop` to a "do-nothing" drop function so that
+    ///   dropping the `Job` struct afterward does not attempt to drop the closure
+    ///   again.
+    ///
+    /// # Safety
+    ///
+    /// Internally uses unsafe raw-pointer calls, but the public API guarantees:
+    /// - The closure is stored correctly.
+    /// - Running a job consumes its stored closure exactly once.
+    ///
+    /// # Example
+    /// ```rust
+    /// # use hft_logger::Job;
+    /// let job = Job::<64>::new(|| println!("Running a job"));
+    /// job.run(); // prints "Running a job"
+    /// ```
     pub fn run(mut self) {
         unsafe {
             (self.fn_call)(self.data.0.as_ptr() as *mut u8);
@@ -122,6 +320,7 @@ impl<const N: usize> Drop for Job<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
