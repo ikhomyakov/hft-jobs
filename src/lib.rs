@@ -1,89 +1,50 @@
 //! A lightweight, allocation-free job system for executing type-erased closures.
 //!
-//! This crate provides the [`Job`] type and helpers (such as the [`log!`] macro)
-//! for storing closures inline in a fixed-size buffer and dispatching them
-//! through worker threads or job queues. Each job carries its own `call`,
-//! `clone`, and `drop` logic via function pointers, allowing predictable,
-//! allocation-free execution.
+//! This crate provides the [`Job`] type, which stores closures inline inside a
+//! fixed-size buffer and executes them without heap allocation. Each job embeds
+//! its own `call`, `clone`, and `drop` functions via type-erased function
+//! pointers, enabling predictable, low-latency execution suitable for
+//! high-frequency or real-time workloads.
 //!
-//! # Example: Running Jobs on a Worker Thread
+//! # Example: Dispatching Jobs to a Worker Thread
 //!
 //! ```rust
 //! use std::sync::mpsc;
 //! use std::thread;
-//! use hft_logger::{Job, log};
+//! use hft_jobs::Job;
 //!
-//! // Create a channel for sending jobs
+//! // Create a channel for sending jobs.
 //! let (tx, rx) = mpsc::channel::<Job>();
 //!
-//! // Spawn a worker thread that receives and runs jobs
+//! // A worker thread that receives and runs jobs.
 //! thread::spawn(move || {
 //!     while let Ok(job) = rx.recv() {
 //!         job.run();
 //!     }
 //! });
 //!
-//! // Send a simple job
+//! // Send a simple job.
 //! let job = Job::<64>::new(|| println!("Hello from a job!"));
 //! tx.send(job).unwrap();
 //!
-//! // Or use the `log!` macro to enqueue a println job
+//! // A convenience macro that enqueues a logging job.
+//! macro_rules! log {
+//!     ($tx:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
+//!         let job = Job::new(move || {
+//!             println!($fmt $(, $arg)*);
+//!         });
+//!         let _ = $tx.send(job);
+//!     }};
+//! }
+//!
+//! // Use the `log!` macro to enqueue a println job.
 //! log!(tx, "Logging from thread: {}", 42);
 //! ```
 //!
 //! This model provides a minimal, fast job runtime suitable for embedded
 //! systems, schedulers, executors, or lightweight logging systems.
+
 use std::{mem, ptr};
-
-/// Asynchronously logs a formatted message by sending a `Job` containing a
-/// `println!` invocation over the provided sender.
-///
-/// # Overview
-/// The `log!` macro constructs a `Job` that, when executed, prints a formatted
-/// message to stdout. Instead of performing I/O immediately, the macro sends
-/// the job through the given channel, allowing logging to occur on a separate
-/// worker thread.
-///
-/// # Parameters
-/// - `tx`: A sender capable of sending `Job` instances (e.g. `std::sync::mpsc::Sender<Job>`).
-/// - `fmt`: A string literal used as the format string for `println!`.
-/// - `args`: Optional additional expressions used to fill formatting placeholders.
-///
-/// The macro accepts an optional trailing comma.
-///
-/// # Behavior
-/// - A closure is created that runs `println!(fmt, args...)`.
-/// - This closure is wrapped in a `Job` via `Job::new`.
-/// - The resulting job is sent through `tx`.
-/// - Any error returned by `send` is ignored.
-///
-/// # Example
-/// ```
-/// # use std::sync::mpsc::channel;
-/// # use hft_logger::{log, Job};
-/// let (tx, rx) = channel::<Job>();
-///
-/// // Spawn a worker thread to run jobs.
-/// std::thread::spawn(move || {
-///     while let Ok(job) = rx.recv() {
-///         job.run();
-///     }
-/// });
-///
-/// log!(tx, "User {} logged in from {}", "alice", "127.0.0.1");
-/// ```
-#[macro_export]
-macro_rules! log {
-    ($tx:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
-        let job = Job::new(move || {
-            println!($fmt $(, $arg)*);
-        });
-        let _ = $tx.send(job);
-    }};
-}
-
-#[repr(align(16))]
-struct Align16<T>(pub T);
 
 /// A type-erased, fixed-size job container for storing and invoking closures.
 ///
@@ -117,24 +78,23 @@ struct Align16<T>(pub T);
 /// instances of `Job` are passed across FFI or need a predictable memory
 /// representation.
 ///
-/// # Safety
+/// # Threading and Lifetime
+/// 
+/// A `Job` created via `Job::new`:
 ///
-/// This type is fundamentally unsafe to construct manually:
-///
-/// * The function pointers **must** be consistent with the actual type stored
-///   inside `data`.
-/// * The `fn_call`, `fn_clone`, and `fn_drop` implementations must only read
-///   and write within the `N`-byte buffer.
-/// * `N` must be at least `size_of::<T>()` for the stored type `T`, and the
-///   alignment provided by `Align16` must be sufficient for `T`.
-///
-/// Incorrect construction or misuse may lead to undefined behavior. Safe APIs
-/// (such as `Job::new`, `Job::run`, etc.) should enforce these invariants.
+/// * is backed by a `FnOnce() + Clone + Send + 'static` callable, ensuring that
+///   the stored closure can be invoked exactly once, cloned for replication,
+///   transferred across threads, and contains no non-`'static` borrows;
+/// * is `Clone`, allowing the same logical callable to be duplicated into
+///   multiple `Job` instances (e.g., for SPMC job queues);
+/// * is `Send`, so it may be moved freely to other threads for execution;
+/// * is `'static`, meaning it holds no borrowed references tied to a shorter
+///   lifetime and may safely outlive the scope in which it was created.
 ///
 /// # Example
 ///
 /// ```rust
-/// # use hft_logger::Job;
+/// # use hft_jobs::Job;
 /// // Typically constructed via a helper like `Job::new`:
 /// let job = Job::<64>::new(|| {
 ///     println!("Hello from a job!");
@@ -151,6 +111,9 @@ pub struct Job<const N: usize = 64> {
     fn_drop: unsafe fn(*mut u8),
 }
 
+#[repr(align(16))]
+struct Align16<T>(pub T);
+
 // SAFETY: Job only ever contains F: FnOnce() + Send + 'static, enforced in Job::new.
 unsafe impl<const N: usize> Send for Job<N> {}
 
@@ -163,7 +126,7 @@ impl<const N: usize> Job<N> {
     /// - `FnOnce()`
     /// - `Clone` — needed so the job queue or scheduler can duplicate jobs if
     ///   desired.
-    /// - `Send` + 'static — ensures the closure may be transferred across threads.
+    /// - `Send + 'static` — ensures the closure may be transferred across threads.
     ///
     /// # Storage Constraints
     /// The closure must fit inside the inline buffer:
@@ -194,7 +157,7 @@ impl<const N: usize> Job<N> {
     ///
     /// # Example
     /// ```
-    /// # use hft_logger::Job;
+    /// # use hft_jobs::Job;
     /// let job = Job::<64>::new(|| println!("Hello from a job!"));
     /// // The job is now a self-contained, type-erased closure.
     /// ```
@@ -273,7 +236,7 @@ impl<const N: usize> Job<N> {
     ///
     /// # Example
     /// ```rust
-    /// # use hft_logger::Job;
+    /// # use hft_jobs::Job;
     /// let job = Job::<64>::new(|| println!("Running a job"));
     /// job.run(); // prints "Running a job"
     /// ```
@@ -441,17 +404,6 @@ mod tests {
         // This should panic on the size assertion inside Job::new::<F, 64>.
         let _job: Job<64> = Job::new(c);
         let _ = _job;
-    }
-
-    #[test]
-    fn log_macro_sends_job_over_channel() {
-        let (tx, rx) = mpsc::channel::<Job>();
-
-        log!(tx, "hello from log macro");
-        let job = rx.recv().expect("expected a Job from log! macro");
-
-        // If this runs without panic, we’re good enough here.
-        job.run();
     }
 
     #[test]

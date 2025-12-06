@@ -1,6 +1,14 @@
 [package]
-name = "hft-logger"
+name = "hft-jobs"
 version = "0.1.0"
 edition = "2024"
+authors = ["IKH Software, Inc. <support@ikhsoftware.com>"]
+license = "LGPL-3.0-or-later"
+repository = "https://github.com/ikhomyakov/hft-jobs.git"
+keywords = ["hft", "low-latency", "real-time", "jobs", "logging"]
+categories = ["concurrency", "data-structures", "memory-management"]
+description = "Allocation-free job system for HFT and real-time systems"
+readme = "README.md"
 
 [dependencies]
+

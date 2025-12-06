@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "hft-logger"
+name = "hft-jobs"
 version = "0.1.0"

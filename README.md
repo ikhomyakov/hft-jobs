@@ -1,14 +1,13 @@
-# Inline, Allocation-Free Job System for Real-Time and HFT-Style Workloads
+# Allocation-free job system for HFT and real-time systems
 
 A lightweight, ultra-low-latency **inline closure job system** designed for **high-frequency trading (HFT)**, real-time processing, and low-latency systems.
 
-Provides predictable performance, zero heap allocations, and carefully controlled memory access patterns.
 Jobs are stored **inline in fixed-size buffers**, using **type erasure** and function pointers for call/clone/drop operations.
 
 Suitable for **thread-to-thread work queues**, **background logging**, **task dispatch**, and **embedded runtimes**.
 
-[![Crates.io](https://img.shields.io/crates/v/hft-logger.svg)](https://crates.io/crates/hft-logger)
-[![Documentation](https://docs.rs/hft-logger/badge.svg)](https://docs.rs/hft-logger)
+[![Crates.io](https://img.shields.io/crates/v/hft-jobs.svg)](https://crates.io/crates/hft-jobs)
+[![Documentation](https://docs.rs/hft-jobs/badge.svg)](https://docs.rs/hft-jobs)
 [![License: LGPL-3.0-or-later](https://img.shields.io/badge/License-LGPL%203.0--or--later-blue.svg)](https://www.gnu.org/licenses/lgpl-3.0)
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org)
 
@@ -18,7 +17,6 @@ Suitable for **thread-to-thread work queues**, **background logging**, **task di
 * **Predictable memory layout** using `repr(C)`
 * **Type-erased call/clone/drop** via function pointers
 * Designed for **real-time logging**, **job queues**, and **worker thread dispatch**
-* Zero allocations after initialization
 * Thread-safe (`Send` requirement for jobs)
 * Compatible with **SPMC**, **MPSC**, and thread-pool patterns
 
@@ -39,7 +37,7 @@ This design is ideal for **HFT**, **real-time telemetry**, **background I/O task
 
 ```toml
 [dependencies]
-hft-logger = "0.1"
+hft-jobs = "0.1"
 ```
 
 ## Quick Example (Thread + MPSC)
@@ -47,7 +45,7 @@ hft-logger = "0.1"
 ```rust
 use std::sync::mpsc;
 use std::thread;
-use hft_logger::{Job, log};
+use hft_jobs::Job;
 
 // Create a simple channel for dispatching jobs to a worker
 let (tx, rx) = mpsc::channel::<Job>();
@@ -63,7 +61,17 @@ thread::spawn(move || {
 let job = Job::<64>::new(|| println!("Hello from a job!"));
 tx.send(job).unwrap();
 
-// Use the log! macro to enqueue a println job
+// A convenience macro that enqueues a logging job.
+macro_rules! log {
+    ($tx:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
+        let job = Job::new(move || {
+            println!($fmt $(, $arg)*);
+        });
+        let _ = $tx.send(job);
+    }};
+}
+
+// Use the `log!` macro to enqueue a println job.
 log!(tx, "Logging from thread: {}", 42);
 ```
 

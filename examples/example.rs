@@ -1,5 +1,15 @@
 use std::{mem, sync::mpsc, thread};
-use hft_logger::{Job, log};
+use hft_jobs::Job;
+
+// A convenience macro that enqueues a logging job. 
+macro_rules! log {
+    ($tx:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
+        let job = Job::new(move || {
+            println!($fmt $(, $arg)*);
+        });
+        let _ = $tx.send(job);
+    }};
+}   
 
 #[derive(Debug, Clone)]
 struct X;
@@ -66,6 +76,12 @@ fn main() {
     });
 
     tx.send(job4).unwrap();
+
+    fn foo() {
+        println!("Hello from foo!");
+    }
+    let job5: Job = Job::new(foo);
+    job5.run();
 
     drop(tx);
     worker.join().unwrap();
