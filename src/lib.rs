@@ -14,7 +14,7 @@ macro_rules! log {
 struct Align16<T>(pub T);
 
 #[repr(C)]
-struct Job<const N: usize = 64> {
+pub struct Job<const N: usize = 64> {
     data: Align16<[u8; N]>, // N must be >= sizeof(biggest closure)
     fn_call: unsafe fn(*mut u8),
     fn_clone: unsafe fn(*const u8, *mut u8),
@@ -25,7 +25,7 @@ struct Job<const N: usize = 64> {
 unsafe impl<const N: usize> Send for Job<N> {}
 
 impl<const N: usize> Job<N> {
-    fn new<F>(f: F) -> Self
+    pub fn new<F>(f: F) -> Self
     where
         F: FnOnce() + Clone + Send + 'static,
     {
@@ -79,7 +79,7 @@ impl<const N: usize> Job<N> {
         job
     }
 
-    fn run(mut self) {
+    pub fn run(mut self) {
         unsafe {
             (self.fn_call)(self.data.0.as_ptr() as *mut u8);
             self.fn_drop = Job::<N>::default().fn_drop;
@@ -117,76 +117,6 @@ impl<const N: usize> Drop for Job<N> {
             (self.fn_drop)(self.data.0.as_mut_ptr());
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct X;
-
-impl Drop for X {
-    fn drop(&mut self) {
-        println!("DROP!");
-    }
-}
-
-fn main() {
-    dbg!(mem::size_of::<Job>());
-    dbg!(mem::align_of::<Job>());
-    let (tx, rx) = mpsc::channel::<Job>();
-
-    // Background thread that *owns* rx and executes jobs
-    let worker = thread::spawn(move || {
-        while let Ok(job) = rx.recv() {
-            job.run();
-        }
-    });
-
-    // "Hot" thread: create a job and move it through the channel
-    log!(tx, "Hello, world!");
-
-    let price = 123_i64;
-    let size = 10_u128;
-    let symbol = "SWPPX";
-    let x = X;
-    log!(
-        tx,
-        "trade: symbol={}, price={} size={}, x={:?}",
-        symbol,
-        price,
-        size,
-        x
-    );
-
-    let a = String::from("Hello");
-    let b = String::from("world");
-    let c: u128 = 42;
-    log!(tx, "{}, {}! {}", a, b, c);
-
-    let mut vs = vec![1, 2, 3];
-    let mut closure1 = move || {
-        vs.push(vs.last().unwrap().clone() + 1);
-        println!("Hello, vec {:?}!", vs);
-    };
-
-    dbg!(mem::size_of_val(&closure1));
-
-    closure1();
-    closure1();
-
-    let job3: Job = Job::new(closure1.clone());
-    dbg!(mem::size_of_val(&job3));
-
-    job3.clone().run();
-    job3.run();
-
-    let job4 = Job::new(move || {
-        closure1.clone()();
-        closure1();
-    });
-
-    tx.send(job4).unwrap();
-
-    drop(tx);
-    worker.join().unwrap();
 }
 
 #[cfg(test)]
