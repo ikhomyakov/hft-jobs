@@ -4,7 +4,7 @@ use std::{mem, sync::mpsc, thread};
 // A convenience macro that enqueues a logging job.
 macro_rules! log {
     ($tx:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
-        let job = Job::<String>::new(move || {
+        let job = Job::<64, String>::new(move || {
             format!($fmt $(, $arg)*)
         });
         let _ = $tx.send(job);
@@ -21,9 +21,9 @@ impl Drop for X {
 }
 
 fn main() {
-    dbg!(mem::size_of::<Job>());
-    dbg!(mem::align_of::<Job>());
-    let (tx, rx) = mpsc::channel::<Job<String>>();
+    dbg!(mem::size_of::<Job<64, ()>>());
+    dbg!(mem::align_of::<Job<64, ()>>());
+    let (tx, rx) = mpsc::channel::<Job<64, String>>();
 
     // Background thread that *owns* rx and executes jobs
     let worker = thread::spawn(move || {
@@ -55,7 +55,7 @@ fn main() {
 
     let mut vs = vec![1, 2, 3];
     let mut closure1 = move || {
-        vs.push(vs.last().unwrap().clone() + 1);
+        vs.push(*vs.last().unwrap() + 1);
         println!("Hello, vec {:?}!", vs);
     };
 
@@ -64,13 +64,13 @@ fn main() {
     closure1();
     closure1();
 
-    let job3: Job = Job::new(closure1.clone());
+    let job3: Job<64, ()> = Job::new(closure1.clone());
     dbg!(mem::size_of_val(&job3));
 
     job3.clone().run();
     job3.run();
 
-    let job4 = Job::<String>::new(move || {
+    let job4 = Job::<64, _>::new(move || {
         closure1.clone()();
         closure1();
         "Test".to_string()
@@ -81,7 +81,7 @@ fn main() {
     fn foo() {
         println!("Hello from foo!");
     }
-    let job5: Job = Job::new(foo);
+    let job5: Job<64, ()> = Job::new(foo);
     job5.run();
 
     drop(tx);

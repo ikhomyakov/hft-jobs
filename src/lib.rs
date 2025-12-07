@@ -6,8 +6,10 @@
 //! pointers, enabling predictable, low-latency execution suitable for
 //! high-frequency or real-time workloads.
 //!
-//! `Job` is generic over the closure's return type `R` (defaulting to `()`),
-//! so jobs can either be fire-and-forget or produce a result.
+//! `Job` is generic over the inline capacity `N` and the closure's return type
+//! `R`, so jobs can either be fire-and-forget (`R = ()`) or produce a result.
+//! The inline storage size `N` has no default; callers must choose a capacity
+//! explicitly.
 //!
 //! # Example: Dispatching Jobs to a Worker Thread
 //!
@@ -17,7 +19,7 @@
 //! use hft_jobs::Job;
 //!
 //! // Create a channel for sending jobs.
-//! let (tx, rx) = mpsc::channel::<Job<String, 24>>();
+//! let (tx, rx) = mpsc::channel::<Job<24, String>>();
 //!
 //! // A worker thread that receives and runs jobs.
 //! thread::spawn(move || {
@@ -28,13 +30,13 @@
 //! });
 //!
 //! // Send a simple job.
-//! let job = Job::<String, 24>::new(|| format!("Hello from a job!"));
+//! let job = Job::<24, _>::new(|| "Hello from a job!".to_string());
 //! tx.send(job).unwrap();
 //!
 //! // A convenience macro that enqueues a logging job.
 //! macro_rules! log {
 //!     ($tx:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
-//!         let job = Job::<String, 24>::new(move || {
+//!         let job = Job::<24, String>::new(move || {
 //!             format!($fmt $(, $arg)*)
 //!         });
 //!         let _ = $tx.send(job);
@@ -62,11 +64,12 @@ use std::{marker::PhantomData, mem, ptr};
 ///
 /// # Type Parameters
 ///
-/// * `R` – The return type of the stored closure. This is the value produced
-///   by [`Job::run`]. The default is `()`.
 /// * `N` – The size of the internal storage buffer, in bytes. This must be
 ///   large enough to hold the largest closure (or callable) you intend to
-///   store. The default is `64`.
+///   store. There is no default; choose the inline capacity that fits your
+///   workload (e.g., `64` for small captures).
+/// * `R` – The return type of the stored closure. This is the value produced
+///   by [`Job::run`]. Use `()` for fire-and-forget jobs (the default).
 ///
 /// # Layout
 ///
@@ -103,7 +106,7 @@ use std::{marker::PhantomData, mem, ptr};
 /// ```rust
 /// # use hft_jobs::Job;
 /// // Typically constructed via a helper like `Job::new`:
-/// let job = Job::<(), 64>::new(|| {
+/// let job = Job::<64>::new(|| {
 ///     println!("Hello from a job!");
 /// });
 ///
@@ -111,7 +114,7 @@ use std::{marker::PhantomData, mem, ptr};
 /// job.run();
 /// ```
 #[repr(C)]
-pub struct Job<R = (), const N: usize = 64> {
+pub struct Job<const N: usize, R = ()> {
     data: Align16<[u8; N]>, // N must be >= sizeof(biggest closure)
     fn_call: unsafe fn(*mut u8) -> R,
     fn_clone: unsafe fn(*const u8, *mut u8),
@@ -124,9 +127,9 @@ struct Align16<T>(pub T);
 
 // SAFETY: Job only ever contains F: FnOnce() -> R + Clone + Send + 'static,
 // enforced in Job::new, so it is safe to move between threads.
-unsafe impl<R, const N: usize> Send for Job<R, N> {}
+unsafe impl<const N: usize, R> Send for Job<N, R> {}
 
-impl<R, const N: usize> Job<R, N> {
+impl<const N: usize, R> Job<N, R> {
     /// Creates a new job from a closure, storing it inline without heap
     /// allocation.
     ///
@@ -171,7 +174,7 @@ impl<R, const N: usize> Job<R, N> {
     ///
     /// ```
     /// # use hft_jobs::Job;
-    /// let job = Job::<(), 64>::new(|| println!("Hello from a job!"));
+    /// let job = Job::<64>::new(|| println!("Hello from a job!"));
     /// // The job is now a self-contained, type-erased closure.
     /// ```
     pub fn new<F>(f: F) -> Self
@@ -267,21 +270,21 @@ impl<R, const N: usize> Job<R, N> {
     ///
     /// ```rust
     /// # use hft_jobs::Job;
-    /// let job = Job::<u32, 64>::new(|| 21 * 2);
+    /// let job = Job::<64, u32>::new(|| 21 * 2);
     /// assert_eq!(job.run(), 42);
     ///
-    /// let void_job = Job::<(), 0>::new(|| println!("Running a job"));
+    /// let void_job = Job::<0>::new(|| println!("Running a job"));
     /// void_job.run(); // prints "Running a job"
     /// ```
     pub fn run(mut self) -> R {
         unsafe {
-            self.fn_drop = Job::<R, N>::default().fn_drop;
+            self.fn_drop = Job::<N, R>::default().fn_drop;
             (self.fn_call)(self.data.0.as_ptr() as *mut u8)
         }
     }
 }
 
-impl<R, const N: usize> Default for Job<R, N> {
+impl<const N: usize, R> Default for Job<N, R> {
     /// Constructs a "default" job which panics if it is ever run.
     ///
     /// This is mainly useful as a placeholder. Calling [`Job::run`] on a
@@ -292,7 +295,7 @@ impl<R, const N: usize> Default for Job<R, N> {
     }
 }
 
-impl<R, const N: usize> Clone for Job<R, N> {
+impl<const N: usize, R> Clone for Job<N, R> {
     /// Clones the underlying closure into a new `Job`.
     ///
     /// Both the original and cloned `Job` instances own independent copies of
@@ -312,7 +315,7 @@ impl<R, const N: usize> Clone for Job<R, N> {
     }
 }
 
-impl<R, const N: usize> Drop for Job<R, N> {
+impl<const N: usize, R> Drop for Job<N, R> {
     /// Drops the stored closure (if any) in place.
     ///
     /// If the job has not been run, this will drop the captured environment of
@@ -339,8 +342,8 @@ mod tests {
     fn assert_send<T: Send>() {}
     #[test]
     fn job_is_send() {
-        assert_send::<Job>();
-        assert_send::<Job<(), 128>>();
+        assert_send::<Job<64, ()>>();
+        assert_send::<Job<128, ()>>();
     }
 
     #[test]
@@ -353,7 +356,7 @@ mod tests {
             }
         };
 
-        let job: Job = Job::new(c);
+        let job: Job<64, ()> = Job::new(c);
         job.run();
 
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -369,7 +372,7 @@ mod tests {
             }
         };
 
-        let job1: Job = Job::new(c);
+        let job1: Job<64, ()> = Job::new(c);
         let job2 = job1.clone();
 
         job1.run();
@@ -401,7 +404,7 @@ mod tests {
                 // Do nothing; we only care about Drop.
                 let _ = &guard;
             };
-            let _job: Job = Job::new(c);
+            let _job: Job<64, ()> = Job::new(c);
             // _job is dropped here without run()
         }
 
@@ -421,7 +424,7 @@ mod tests {
                 // be dropped at end of call.
                 let _ = &guard;
             };
-            let job: Job = Job::new(c);
+            let job: Job<64, ()> = Job::new(c);
             job.run();
             // After run(), Job's Drop should not try to drop the original F again.
         }
@@ -433,7 +436,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "attempt to execute an empty job")]
     fn default_job_panics_on_run() {
-        let job: Job = Job::default();
+        let job: Job<64, ()> = Job::default();
         job.run();
     }
 
@@ -447,14 +450,14 @@ mod tests {
         };
 
         // This should panic on the size assertion inside Job::new::<F, 64>.
-        let _job: Job<(), 64> = Job::new(c);
+        let _job: Job<64, ()> = Job::new(c);
         let _ = _job;
     }
 
     #[test]
     fn job_can_be_sent_to_worker_thread_and_run() {
         let counter = Arc::new(AtomicUsize::new(0));
-        let (tx, rx) = mpsc::channel::<Job<(), 1024>>();
+        let (tx, rx) = mpsc::channel::<Job<1024, ()>>();
 
         // Worker thread that receives and runs jobs.
         let worker_counter = counter.clone();
@@ -497,27 +500,27 @@ mod tests {
         assert!(align_f <= mem::align_of::<Align16<[u8; 64]>>());
 
         // Should not panic:
-        let job: Job = Job::new(c);
+        let job: Job<64, ()> = Job::new(c);
         job.run();
     }
 
     #[test]
     fn job_returns_value() {
-        let job: Job<u32> = Job::new(|| 40 + 2);
+        let job: Job<64, u32> = Job::new(|| 40 + 2);
         let result = job.run();
         assert_eq!(result, 42);
     }
 
     #[test]
     fn job_returns_owned_string() {
-        let job: Job<String> = Job::new(|| "hello".to_owned() + " world");
+        let job: Job<64, _> = Job::new(|| "hello".to_owned() + " world");
         let result = job.run();
         assert_eq!(result, "hello world");
     }
 
     #[test]
     fn cloned_jobs_both_return_values() {
-        let job1: Job<u64> = Job::new(|| 10u64 * 10);
+        let job1: Job<64, u64> = Job::new(|| 10u64 * 10);
         let job2 = job1.clone();
 
         let r1 = job1.run();
@@ -529,7 +532,7 @@ mod tests {
 
     #[test]
     fn job_with_result_can_be_sent_to_worker_thread() {
-        let (tx, rx) = mpsc::channel::<Job<u32, 128>>();
+        let (tx, rx) = mpsc::channel::<Job<128, u32>>();
 
         // Worker thread that receives jobs and collects their results.
         let worker = thread::spawn(move || {
@@ -558,7 +561,7 @@ mod tests {
     #[test]
     fn example_from_readme() {
         // Create a simple channel for dispatching jobs to a worker
-        let (tx, rx) = mpsc::channel::<Job<String, 64>>();
+        let (tx, rx) = mpsc::channel::<Job<64, _>>();
 
         // Spawn the worker thread
         thread::spawn(move || {
@@ -569,13 +572,13 @@ mod tests {
         });
 
         // Send a job
-        let job = Job::<String, 64>::new(|| format!("Hello from a job!"));
+        let job = Job::<64, _>::new(|| "Hello from a job!".to_string());
         tx.send(job).unwrap();
 
         // A convenience macro that enqueues a logging job.
         macro_rules! log {
             ($tx:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
-                let job = Job::<String, 64>::new(move || {
+                let job = Job::<64, String>::new(move || {
                     format!($fmt $(, $arg)*)
                 });
                 let _ = $tx.send(job);
