@@ -89,7 +89,7 @@ for your biggest closure capture:
 
 - `64` bytes works for most lightweight logging/telemetry closures.
 - Larger captures (e.g., big structs or arrays) may need `128` or `256`.
-- Oversizing is cheap—storage is inline and fixed at compile time.
+- Oversizing is cheap (storage is inline) and fixed at compile time.
 
 ### Generic parameters
 
