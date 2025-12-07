@@ -6,6 +6,11 @@
 //! pointers, enabling predictable, low-latency execution suitable for
 //! high-frequency or real-time workloads.
 //!
+//! `Job` is generic over the inline capacity `N` and the closure's return type
+//! `R`, so jobs can either be fire-and-forget (`R = ()`) or produce a result.
+//! The inline storage size `N` has no default; callers must choose a capacity
+//! explicitly.
+//!
 //! # Example: Dispatching Jobs to a Worker Thread
 //!
 //! ```rust
@@ -14,24 +19,25 @@
 //! use hft_jobs::Job;
 //!
 //! // Create a channel for sending jobs.
-//! let (tx, rx) = mpsc::channel::<Job>();
+//! let (tx, rx) = mpsc::channel::<Job<24, String>>();
 //!
 //! // A worker thread that receives and runs jobs.
 //! thread::spawn(move || {
 //!     while let Ok(job) = rx.recv() {
-//!         job.run();
+//!         let s = job.run();
+//!         println!("{}", s);
 //!     }
 //! });
 //!
 //! // Send a simple job.
-//! let job = Job::<64>::new(|| println!("Hello from a job!"));
+//! let job = Job::<24, _>::new(|| "Hello from a job!".to_string());
 //! tx.send(job).unwrap();
 //!
 //! // A convenience macro that enqueues a logging job.
 //! macro_rules! log {
 //!     ($tx:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
-//!         let job = Job::new(move || {
-//!             println!($fmt $(, $arg)*);
+//!         let job = Job::<24, String>::new(move || {
+//!             format!($fmt $(, $arg)*)
 //!         });
 //!         let _ = $tx.send(job);
 //!     }};
@@ -44,7 +50,7 @@
 //! This model provides a minimal, fast job runtime suitable for embedded
 //! systems, schedulers, executors, or lightweight logging systems.
 
-use std::{mem, ptr};
+use std::{marker::PhantomData, mem, ptr};
 
 /// A type-erased, fixed-size job container for storing and invoking closures.
 ///
@@ -60,15 +66,18 @@ use std::{mem, ptr};
 ///
 /// * `N` – The size of the internal storage buffer, in bytes. This must be
 ///   large enough to hold the largest closure (or callable) you intend to
-///   store. The default is `64`.
+///   store. There is no default; choose the inline capacity that fits your
+///   workload (e.g., `64` for small captures).
+/// * `R` – The return type of the stored closure. This is the value produced
+///   by [`Job::run`]. Use `()` for fire-and-forget jobs (the default).
 ///
 /// # Layout
 ///
 /// * `data` – An `Align16<[u8; N]>` buffer that stores the erased closure.
 ///   The alignment wrapper ensures the buffer has at least 16-byte alignment,
 ///   which is typically sufficient for most captured types.
-/// * `fn_call` – An `unsafe fn(*mut u8)` that takes a pointer into `data` and
-///   invokes the stored callable.
+/// * `fn_call` – An `unsafe fn(*mut u8) -> R` that takes a pointer into
+///   `data`, invokes the stored callable, and returns its result.
 /// * `fn_clone` – An `unsafe fn(*const u8, *mut u8)` that clones the stored
 ///   value from one buffer to another (source and destination pointers into
 ///   `data`-like storage).
@@ -79,12 +88,13 @@ use std::{mem, ptr};
 /// representation.
 ///
 /// # Threading and Lifetime
-/// 
-/// A `Job` created via `Job::new`:
 ///
-/// * is backed by a `FnOnce() + Clone + Send + 'static` callable, ensuring that
-///   the stored closure can be invoked exactly once, cloned for replication,
-///   transferred across threads, and contains no non-`'static` borrows;
+/// A `Job` created via [`Job::new`]:
+///
+/// * is backed by a `FnOnce() -> R + Clone + Send + 'static` callable,
+///   ensuring that the stored closure can be invoked exactly once, cloned for
+///   replication, transferred across threads, and contains no non-`'static`
+///   borrows;
 /// * is `Clone`, allowing the same logical callable to be duplicated into
 ///   multiple `Job` instances (e.g., for SPMC job queues);
 /// * is `Send`, so it may be moved freely to other threads for execution;
@@ -104,31 +114,36 @@ use std::{mem, ptr};
 /// job.run();
 /// ```
 #[repr(C)]
-pub struct Job<const N: usize = 64> {
+pub struct Job<const N: usize, R = ()> {
     data: Align16<[u8; N]>, // N must be >= sizeof(biggest closure)
-    fn_call: unsafe fn(*mut u8),
+    fn_call: unsafe fn(*mut u8) -> R,
     fn_clone: unsafe fn(*const u8, *mut u8),
     fn_drop: unsafe fn(*mut u8),
+    _marker: PhantomData<R>,
 }
 
 #[repr(align(16))]
 struct Align16<T>(pub T);
 
-// SAFETY: Job only ever contains F: FnOnce() + Send + 'static, enforced in Job::new.
-unsafe impl<const N: usize> Send for Job<N> {}
+// SAFETY: Job only ever contains F: FnOnce() -> R + Clone + Send + 'static,
+// enforced in Job::new, so it is safe to move between threads.
+unsafe impl<const N: usize, R> Send for Job<N, R> {}
 
-impl<const N: usize> Job<N> {
+impl<const N: usize, R> Job<N, R> {
     /// Creates a new job from a closure, storing it inline without heap
     /// allocation.
     ///
     /// # Type Requirements
+    ///
     /// The closure `F` must satisfy:
-    /// - `FnOnce()`
+    /// - `FnOnce() -> R` — the closure is invoked exactly once to produce `R`;
     /// - `Clone` — needed so the job queue or scheduler can duplicate jobs if
-    ///   desired.
-    /// - `Send + 'static` — ensures the closure may be transferred across threads.
+    ///   desired;
+    /// - `Send + 'static` — ensures the closure may be transferred across
+    ///   threads and does not borrow non-`'static` data.
     ///
     /// # Storage Constraints
+    ///
     /// The closure must fit inside the inline buffer:
     /// - `size_of::<F>() <= N`
     /// - `align_of::<F>() <= align_of::<Align16<[u8; N]>>`
@@ -141,8 +156,8 @@ impl<const N: usize> Job<N> {
     /// 1. Generates specialized `fn_call`, `fn_clone`, and `fn_drop` functions
     ///    for the captured closure type `F`.
     /// 2. Writes the closure directly into the inline buffer using
-    ///    `ptr::write`, avoiding heap allocations.
-    /// 3. Returns a fully-constructed `Job` that owns the closure.
+    ///    [`ptr::write`], avoiding heap allocations.
+    /// 3. Returns a fully-constructed [`Job`] that owns the closure.
     ///
     /// # Safety
     ///
@@ -156,6 +171,7 @@ impl<const N: usize> Job<N> {
     /// - The caller cannot violate the type invariants through the public API.
     ///
     /// # Example
+    ///
     /// ```
     /// # use hft_jobs::Job;
     /// let job = Job::<64>::new(|| println!("Hello from a job!"));
@@ -163,7 +179,7 @@ impl<const N: usize> Job<N> {
     /// ```
     pub fn new<F>(f: F) -> Self
     where
-        F: FnOnce() + Clone + Send + 'static,
+        F: FnOnce() -> R + Clone + Send + 'static,
     {
         // dbg!(mem::size_of::<F>());
         // dbg!(mem::align_of::<F>());
@@ -173,18 +189,21 @@ impl<const N: usize> Job<N> {
         assert!(mem::size_of::<F>() <= N);
         assert!(mem::align_of::<F>() <= mem::align_of::<Align16<[u8; N]>>());
 
-        unsafe fn fn_call<F: FnOnce()>(data: *mut u8) {
+        unsafe fn fn_call<R, F>(data: *mut u8) -> R
+        where
+            F: FnOnce() -> R,
+        {
             // Recreate the closure from the buffer and run it.
-            // `read` takes ownership, so `F: FnOnce()` is fine.
+            // `read` takes ownership, so `F: FnOnce() -> R` is fine.
             unsafe {
                 let f = ptr::read(data as *const F);
-                f();
+                f()
             }
         }
 
-        unsafe fn fn_clone<F>(src: *const u8, dst: *mut u8)
+        unsafe fn fn_clone<R, F>(src: *const u8, dst: *mut u8)
         where
-            F: FnOnce() + Clone,
+            F: FnOnce() -> R + Clone,
         {
             unsafe {
                 let f_src = &*(src as *const F);
@@ -193,86 +212,115 @@ impl<const N: usize> Job<N> {
             }
         }
 
-        unsafe fn fn_drop<F: FnOnce()>(data: *mut u8) {
+        unsafe fn fn_drop<R, F>(data: *mut u8)
+        where
+            F: FnOnce() -> R,
+        {
             unsafe {
                 ptr::drop_in_place(data as *mut F);
             }
         }
 
         let mut job = Job {
-            fn_call: fn_call::<F>,
-            fn_clone: fn_clone::<F>,
-            fn_drop: fn_drop::<F>,
+            fn_call: fn_call::<R, F>,
+            fn_clone: fn_clone::<R, F>,
+            fn_drop: fn_drop::<R, F>,
             data: Align16([0u8; N]),
+            _marker: PhantomData,
         };
-
         unsafe {
             // Place the closure into `data` without heap allocation
             let dst = job.data.0.as_mut_ptr() as *mut F;
             ptr::write(dst, f);
         }
-
         job
     }
 
-    /// Runs the stored closure, consuming the job.
+    /// Runs the stored closure, consuming the job and returning its result `R`.
     ///
-    /// This invokes the closure that was previously stored in the inline buffer.
-    /// After invocation, the job's drop function pointer is reset to the default
-    /// `fn_drop`, preventing the closure from being dropped **twice**.
+    /// This method invokes the closure that was previously stored in the inline
+    /// buffer. Running the job consumes its captured environment and yields
+    /// a value of type `R`.
+    ///
+    /// After invocation, the job's internal `fn_drop` function pointer is replaced
+    /// with a no-op drop function, ensuring that the closure's environment is not
+    /// dropped **twice** when the `Job` itself is later dropped.
     ///
     /// # How it Works
-    /// - `fn_call` takes ownership of the closure by reading it out of the buffer.
-    /// - The closure is executed.
-    /// - The job updates `fn_drop` to a "do-nothing" drop function so that
-    ///   dropping the `Job` struct afterward does not attempt to drop the closure
-    ///   again.
+    ///
+    /// - `fn_call` reconstructs the original closure from the buffer, taking
+    ///   ownership of it.
+    /// - The closure is executed, and its return value is propagated back to the
+    ///   caller as `R`.
+    /// - Because the closure has now been consumed, `fn_drop` is overwritten with
+    ///   a version that performs no action, preventing a double-drop.
     ///
     /// # Safety
     ///
-    /// Internally uses unsafe raw-pointer calls, but the public API guarantees:
-    /// - The closure is stored correctly.
-    /// - Running a job consumes its stored closure exactly once.
+    /// Although this method uses unsafe raw-pointer calls internally, it is safe
+    /// to use because:
+    ///
+    /// - The closure is guaranteed (via `Job::new`) to fit in the inline buffer
+    ///   with correct alignment.
+    /// - The closure is executed exactly once.
+    /// - The memory backing the closure is never accessed again after ownership
+    ///   is taken by `fn_call`.
     ///
     /// # Example
+    ///
     /// ```rust
     /// # use hft_jobs::Job;
-    /// let job = Job::<64>::new(|| println!("Running a job"));
-    /// job.run(); // prints "Running a job"
+    /// let job = Job::<64, u32>::new(|| 21 * 2);
+    /// assert_eq!(job.run(), 42);
+    ///
+    /// let void_job = Job::<0>::new(|| println!("Running a job"));
+    /// void_job.run(); // prints "Running a job"
     /// ```
-    pub fn run(mut self) {
+    pub fn run(mut self) -> R {
         unsafe {
-            (self.fn_call)(self.data.0.as_ptr() as *mut u8);
-            self.fn_drop = Job::<N>::default().fn_drop;
+            self.fn_drop = Job::<N, R>::default().fn_drop;
+            (self.fn_call)(self.data.0.as_ptr() as *mut u8)
         }
     }
 }
 
-impl<const N: usize> Default for Job<N> {
+impl<const N: usize, R> Default for Job<N, R> {
+    /// Constructs a "default" job which panics if it is ever run.
+    ///
+    /// This is mainly useful as a placeholder. Calling [`Job::run`] on a
+    /// default-constructed job will panic with the message
+    /// `"attempt to execute an empty job"`.
     fn default() -> Self {
         Self::new(|| panic!("attempt to execute an empty job"))
     }
 }
 
-impl<const N: usize> Clone for Job<N> {
+impl<const N: usize, R> Clone for Job<N, R> {
+    /// Clones the underlying closure into a new `Job`.
+    ///
+    /// Both the original and cloned `Job` instances own independent copies of
+    /// the captured environment and can be run separately.
     fn clone(&self) -> Self {
         let mut new_job = Job {
             fn_call: self.fn_call,
             fn_clone: self.fn_clone,
             fn_drop: self.fn_drop,
             data: Align16([0u8; N]),
+            _marker: PhantomData,
         };
         unsafe {
-            (self.fn_clone)(
-                self.data.0.as_ptr() as *const u8,
-                new_job.data.0.as_mut_ptr() as *mut u8,
-            );
+            (self.fn_clone)(self.data.0.as_ptr(), new_job.data.0.as_mut_ptr());
         }
         new_job
     }
 }
 
-impl<const N: usize> Drop for Job<N> {
+impl<const N: usize, R> Drop for Job<N, R> {
+    /// Drops the stored closure (if any) in place.
+    ///
+    /// If the job has not been run, this will drop the captured environment of
+    /// the stored closure. If the job **has** been run, [`Job::run`] ensures
+    /// that `fn_drop` has been replaced so that no double-drop occurs.
     fn drop(&mut self) {
         unsafe {
             (self.fn_drop)(self.data.0.as_mut_ptr());
@@ -283,19 +331,19 @@ impl<const N: usize> Drop for Job<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     };
+    use std::thread;
 
     /// Helper: prove at compile time that Job is Send.
     fn assert_send<T: Send>() {}
     #[test]
     fn job_is_send() {
-        assert_send::<Job>();
-        assert_send::<Job<128>>();
+        assert_send::<Job<64, ()>>();
+        assert_send::<Job<128, ()>>();
     }
 
     #[test]
@@ -308,7 +356,7 @@ mod tests {
             }
         };
 
-        let job: Job = Job::new(c);
+        let job: Job<64, ()> = Job::new(c);
         job.run();
 
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -324,7 +372,7 @@ mod tests {
             }
         };
 
-        let job1: Job = Job::new(c);
+        let job1: Job<64, ()> = Job::new(c);
         let job2 = job1.clone();
 
         job1.run();
@@ -356,7 +404,7 @@ mod tests {
                 // Do nothing; we only care about Drop.
                 let _ = &guard;
             };
-            let _job: Job = Job::new(c);
+            let _job: Job<64, ()> = Job::new(c);
             // _job is dropped here without run()
         }
 
@@ -376,7 +424,7 @@ mod tests {
                 // be dropped at end of call.
                 let _ = &guard;
             };
-            let job: Job = Job::new(c);
+            let job: Job<64, ()> = Job::new(c);
             job.run();
             // After run(), Job's Drop should not try to drop the original F again.
         }
@@ -388,7 +436,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "attempt to execute an empty job")]
     fn default_job_panics_on_run() {
-        let job: Job = Job::default();
+        let job: Job<64, ()> = Job::default();
         job.run();
     }
 
@@ -402,14 +450,14 @@ mod tests {
         };
 
         // This should panic on the size assertion inside Job::new::<F, 64>.
-        let _job: Job<64> = Job::new(c);
+        let _job: Job<64, ()> = Job::new(c);
         let _ = _job;
     }
 
     #[test]
     fn job_can_be_sent_to_worker_thread_and_run() {
         let counter = Arc::new(AtomicUsize::new(0));
-        let (tx, rx) = mpsc::channel::<Job<1024>>();
+        let (tx, rx) = mpsc::channel::<Job<1024, ()>>();
 
         // Worker thread that receives and runs jobs.
         let worker_counter = counter.clone();
@@ -452,7 +500,92 @@ mod tests {
         assert!(align_f <= mem::align_of::<Align16<[u8; 64]>>());
 
         // Should not panic:
-        let job: Job = Job::new(c);
+        let job: Job<64, ()> = Job::new(c);
         job.run();
+    }
+
+    #[test]
+    fn job_returns_value() {
+        let job: Job<64, u32> = Job::new(|| 40 + 2);
+        let result = job.run();
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn job_returns_owned_string() {
+        let job: Job<64, _> = Job::new(|| "hello".to_owned() + " world");
+        let result = job.run();
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn cloned_jobs_both_return_values() {
+        let job1: Job<64, u64> = Job::new(|| 10u64 * 10);
+        let job2 = job1.clone();
+
+        let r1 = job1.run();
+        let r2 = job2.run();
+
+        assert_eq!(r1, 100);
+        assert_eq!(r2, 100);
+    }
+
+    #[test]
+    fn job_with_result_can_be_sent_to_worker_thread() {
+        let (tx, rx) = mpsc::channel::<Job<128, u32>>();
+
+        // Worker thread that receives jobs and collects their results.
+        let worker = thread::spawn(move || {
+            let mut results = Vec::new();
+            while let Ok(job) = rx.recv() {
+                results.push(job.run());
+            }
+            results
+        });
+
+        // Send a few value-returning jobs.
+        for i in 0..3u32 {
+            let job = Job::new(move || i * 2);
+            tx.send(job).unwrap();
+        }
+
+        drop(tx); // close channel
+        let results = worker.join().unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(results.contains(&0));
+        assert!(results.contains(&2));
+        assert!(results.contains(&4));
+    }
+
+    #[test]
+    fn example_from_readme() {
+        // Create a simple channel for dispatching jobs to a worker
+        let (tx, rx) = mpsc::channel::<Job<64, _>>();
+
+        // Spawn the worker thread
+        thread::spawn(move || {
+            while let Ok(job) = rx.recv() {
+                let s = job.run(); // executes the closure
+                println!("{}", s);
+            }
+        });
+
+        // Send a job
+        let job = Job::<64, _>::new(|| "Hello from a job!".to_string());
+        tx.send(job).unwrap();
+
+        // A convenience macro that enqueues a logging job.
+        macro_rules! log {
+            ($tx:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
+                let job = Job::<64, String>::new(move || {
+                    format!($fmt $(, $arg)*)
+                });
+                let _ = $tx.send(job);
+            }};
+        }
+
+        // Use the `log!` macro to enqueue a logging job.
+        log!(tx, "Logging from thread: {}", 42);
     }
 }

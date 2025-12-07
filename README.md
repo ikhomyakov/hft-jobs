@@ -19,6 +19,8 @@ Suitable for **thread-to-thread work queues**, **background logging**, **task di
 * Designed for **real-time logging**, **job queues**, and **worker thread dispatch**
 * Thread-safe (`Send` requirement for jobs)
 * Compatible with **SPMC**, **MPSC**, and thread-pool patterns
+* Explicit inline capacity via const generic (`Job<N, R>`), so you size storage for your largest capture
+* Return type is generic (`R`, defaulting to `()`), so jobs can either be fire-and-forget or yield a value
 
 ## Latency Characteristics
 
@@ -37,7 +39,7 @@ This design is ideal for **HFT**, **real-time telemetry**, **background I/O task
 
 ```toml
 [dependencies]
-hft-jobs = "0.1"
+hft-jobs = "0.2"
 ```
 
 ## Quick Example (Thread + MPSC)
@@ -47,35 +49,52 @@ use std::sync::mpsc;
 use std::thread;
 use hft_jobs::Job;
 
-// Create a simple channel for dispatching jobs to a worker
-let (tx, rx) = mpsc::channel::<Job>();
+// Create a simple channel for dispatching jobs to a worker.
+// `Job<N, R>` now requires an explicit inline capacity; 64 bytes works well
+// for small captures.
+let (tx, rx) = mpsc::channel::<Job<64, String>>();
 
 // Spawn the worker thread
 thread::spawn(move || {
     while let Ok(job) = rx.recv() {
-        job.run(); // executes the closure
+        let s = job.run(); // executes the closure
+        println!("{}", s);
     }
 });
 
 // Send a job
-let job = Job::<64>::new(|| println!("Hello from a job!"));
+let job = Job::<64, _>::new(|| "Hello from a job!".to_string());
 tx.send(job).unwrap();
 
 // A convenience macro that enqueues a logging job.
 macro_rules! log {
     ($tx:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
-        let job = Job::new(move || {
-            println!($fmt $(, $arg)*);
+        let job = Job::<64, String>::new(move || {
+            format!($fmt $(, $arg)*)
         });
         let _ = $tx.send(job);
     }};
 }
 
-// Use the `log!` macro to enqueue a println job.
+// Use the `log!` macro to enqueue a logging job.
 log!(tx, "Logging from thread: {}", 42);
 ```
 
 This creates a minimal, allocation-free job execution pipeline.
+
+### Choosing an inline capacity
+
+`Job<N, R>` requires an explicit inline buffer size `N`. Pick a value large enough
+for your biggest closure capture:
+
+- `64` bytes works for most lightweight logging/telemetry closures.
+- Larger captures (e.g., big structs or arrays) may need `128` or `256`.
+- Oversizing is cheap (storage is inline) and fixed at compile time.
+
+### Generic parameters
+
+- `N`: inline buffer size in bytes (must be provided). Choose a capacity that fits your largest closure capture.
+- `R`: return type of the stored closure. Defaults to `()`, so you only specify it when you need to return a value (e.g., `Job<64, String>`).
 
 ## Design Overview
 
@@ -120,4 +139,3 @@ Contributions are welcome! Please open issues or pull requests on GitHub.
 
 By submitting a contribution, you agree that it will be licensed under the
 project’s **LGPL-3.0-or-later** license.
-
