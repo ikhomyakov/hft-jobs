@@ -48,30 +48,31 @@ use std::thread;
 use hft_jobs::Job;
 
 // Create a simple channel for dispatching jobs to a worker
-let (tx, rx) = mpsc::channel::<Job>();
+let (tx, rx) = mpsc::channel::<Job<String, 64>>();
 
 // Spawn the worker thread
 thread::spawn(move || {
     while let Ok(job) = rx.recv() {
-        job.run(); // executes the closure
+        let s = job.run(); // executes the closure
+        println!("{}", s);
     }
 });
 
 // Send a job
-let job = Job::<64>::new(|| println!("Hello from a job!"));
+let job = Job::<String, 64>::new(|| format!("Hello from a job!"));
 tx.send(job).unwrap();
 
 // A convenience macro that enqueues a logging job.
 macro_rules! log {
     ($tx:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
-        let job = Job::new(move || {
-            println!($fmt $(, $arg)*);
+        let job = Job::<String, 64>::new(move || {
+            format!($fmt $(, $arg)*)
         });
         let _ = $tx.send(job);
     }};
 }
 
-// Use the `log!` macro to enqueue a println job.
+// Use the `log!` macro to enqueue a logging job.
 log!(tx, "Logging from thread: {}", 42);
 ```
 

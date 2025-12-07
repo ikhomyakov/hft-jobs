@@ -1,15 +1,15 @@
-use std::{mem, sync::mpsc, thread};
 use hft_jobs::Job;
+use std::{mem, sync::mpsc, thread};
 
-// A convenience macro that enqueues a logging job. 
+// A convenience macro that enqueues a logging job.
 macro_rules! log {
     ($tx:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
-        let job = Job::new(move || {
-            println!($fmt $(, $arg)*);
+        let job = Job::<String>::new(move || {
+            format!($fmt $(, $arg)*)
         });
         let _ = $tx.send(job);
     }};
-}   
+}
 
 #[derive(Debug, Clone)]
 struct X;
@@ -23,12 +23,12 @@ impl Drop for X {
 fn main() {
     dbg!(mem::size_of::<Job>());
     dbg!(mem::align_of::<Job>());
-    let (tx, rx) = mpsc::channel::<Job>();
+    let (tx, rx) = mpsc::channel::<Job<String>>();
 
     // Background thread that *owns* rx and executes jobs
     let worker = thread::spawn(move || {
         while let Ok(job) = rx.recv() {
-            job.run();
+            println!("{}", job.run());
         }
     });
 
@@ -70,9 +70,10 @@ fn main() {
     job3.clone().run();
     job3.run();
 
-    let job4 = Job::new(move || {
+    let job4 = Job::<String>::new(move || {
         closure1.clone()();
         closure1();
+        "Test".to_string()
     });
 
     tx.send(job4).unwrap();
