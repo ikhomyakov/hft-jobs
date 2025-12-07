@@ -1,5 +1,12 @@
 # Release Notes
 
+## [0.3.0] — 2025-12-08
+
+### Improvements
+
+* Added optional context support via `Job<N, R, C>` with `new_with_ctx` and `run_with_ctx`, plus `new`/`run` conveniences for `C = ()`.
+* Documented the context API in README and crate docs, including examples and a unit test.
+
 ## [0.2.0] — 2025-12-07
 
 ### ⚠️  Breaking Changes
@@ -11,5 +18,3 @@
 * Refined documentation to clearly describe the behavior and constraints of `Job<N, R = ()>`, including how run consumes the closure and handles drop semantics without double-dropping.
 
 * Added tests for value-returning jobs (e.g., numeric and String results).
-
-* Updated documentation, examples, and tests to show the explicit inline-capacity requirement.
