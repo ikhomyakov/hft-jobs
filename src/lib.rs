@@ -197,9 +197,11 @@ impl<const N: usize, R, C> Job<N, R, C> {
     where
         F: FnOnce(&mut C) -> R + Clone + Send + 'static,
     {
-        // Ensure the closure fits into our inline storage
-        assert!(mem::size_of::<F>() <= N);
-        assert!(mem::align_of::<F>() <= mem::align_of::<Align16<[u8; N]>>());
+        // Ensure (at compile time) that the closure fits into our inline storage
+        const {
+            assert!(mem::size_of::<F>() <= N);
+            assert!(mem::align_of::<F>() <= mem::align_of::<Align16<[u8; N]>>());
+        }
 
         unsafe fn fn_call<R, C, F>(data: *mut u8, ctx: &mut C) -> R
         where
@@ -486,20 +488,6 @@ mod tests {
     fn default_job_panics_on_run() {
         let job: Job<64, ()> = Job::default();
         job.run();
-    }
-
-    #[test]
-    #[should_panic]
-    fn job_new_panics_if_closure_too_big() {
-        // Capture a big array by value so the closure is larger than N=64 bytes.
-        let big = [0u8; 128];
-        let c = move || {
-            let _ = &big;
-        };
-
-        // This should panic on the size assertion inside Job::new::<F, 64>.
-        let _job: Job<64, ()> = Job::new(c);
-        let _ = _job;
     }
 
     #[test]
