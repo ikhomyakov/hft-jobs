@@ -50,7 +50,7 @@
 //! This model provides a minimal, fast job runtime suitable for embedded
 //! systems, schedulers, executors, or lightweight logging systems.
 
-use std::{marker::PhantomData, mem, ptr};
+use std::{fmt, marker::PhantomData, mem, ptr};
 
 /// A type-erased, fixed-size job container for storing and invoking closures.
 ///
@@ -125,6 +125,48 @@ pub struct Job<const N: usize, R = ()> {
 #[repr(align(16))]
 struct Align16<T>(pub T);
 
+/// Errors that can occur when constructing a [`Job`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobInitError {
+    /// The closure does not fit inside the inline buffer of size `N`.
+    TooLarge {
+        /// The size in bytes of the closure type.
+        size: usize,
+        /// The inline buffer capacity in bytes.
+        capacity: usize,
+    },
+    /// The closure's alignment requirement exceeds the storage alignment.
+    InsufficientAlignment {
+        /// The alignment required by the closure type.
+        align: usize,
+        /// The maximum alignment provided by the job storage.
+        max_align: usize,
+    },
+}
+
+impl fmt::Display for JobInitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JobInitError::TooLarge { size, capacity } => {
+                write!(
+                    f,
+                    "closure of size {} bytes exceeds inline capacity {} bytes",
+                    size, capacity
+                )
+            }
+            JobInitError::InsufficientAlignment { align, max_align } => {
+                write!(
+                    f,
+                    "closure alignment {} exceeds inline alignment {}",
+                    align, max_align
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for JobInitError {}
+
 // SAFETY: Job only ever contains F: FnOnce() -> R + Clone + Send + 'static,
 // enforced in Job::new, so it is safe to move between threads.
 unsafe impl<const N: usize, R> Send for Job<N, R> {}
@@ -181,14 +223,48 @@ impl<const N: usize, R> Job<N, R> {
     where
         F: FnOnce() -> R + Clone + Send + 'static,
     {
-        // dbg!(mem::size_of::<F>());
-        // dbg!(mem::align_of::<F>());
-        // dbg!(mem::align_of::<Align16<[u8; N]>>());
+        Self::try_new(f).unwrap_or_else(|err| panic!("{}", err))
+    }
 
-        // Ensure the closure fits into our inline storage
-        assert!(mem::size_of::<F>() <= N);
-        assert!(mem::align_of::<F>() <= mem::align_of::<Align16<[u8; N]>>());
+    /// Like [`Job::new`], but returns an error instead of panicking when the
+    /// closure does not fit in the inline buffer or exceeds alignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns:
+    /// - `JobInitError::TooLarge` if `size_of::<F>() > N`
+    /// - `JobInitError::InsufficientAlignment` if
+    ///   `align_of::<F>() > align_of::<Align16<[u8; N]>>()`
+    pub fn try_new<F>(f: F) -> Result<Self, JobInitError>
+    where
+        F: FnOnce() -> R + Clone + Send + 'static,
+    {
+        let size_f = mem::size_of::<F>();
+        let align_f = mem::align_of::<F>();
+        let storage_align = mem::align_of::<Align16<[u8; N]>>();
 
+        if size_f > N {
+            return Err(JobInitError::TooLarge {
+                size: size_f,
+                capacity: N,
+            });
+        }
+
+        if align_f > storage_align {
+            return Err(JobInitError::InsufficientAlignment {
+                align: align_f,
+                max_align: storage_align,
+            });
+        }
+
+        Ok(Self::build_job(f))
+    }
+
+    /// Internal helper that writes the closure into the inline buffer.
+    fn build_job<F>(f: F) -> Self
+    where
+        F: FnOnce() -> R + Clone + Send + 'static,
+    {
         unsafe fn fn_call<R, F>(data: *mut u8) -> R
         where
             F: FnOnce() -> R,
@@ -452,6 +528,48 @@ mod tests {
         // This should panic on the size assertion inside Job::new::<F, 64>.
         let _job: Job<64, ()> = Job::new(c);
         let _ = _job;
+    }
+
+    #[test]
+    fn try_new_returns_error_instead_of_panicking_for_large_closure() {
+        let big = [0u8; 128];
+        let c = move || {
+            let _ = &big;
+        };
+
+        match Job::<64, ()>::try_new(c) {
+            Err(JobInitError::TooLarge { size, capacity }) => {
+                assert!(size > capacity);
+            }
+            Err(other) => panic!("unexpected error: {:?}", other),
+            Ok(_) => panic!("expected try_new to fail for oversized closure"),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    #[repr(align(32))]
+    struct Align32;
+
+    #[test]
+    fn try_new_reports_alignment_mismatch() {
+        let aligned = Align32;
+        let c = move || {
+            let _ = &aligned;
+        };
+
+        match Job::<64, ()>::try_new(c) {
+            Err(JobInitError::InsufficientAlignment { align, max_align }) => {
+                assert!(align > max_align);
+            }
+            Err(other) => panic!("unexpected error: {:?}", other),
+            Ok(_) => panic!("expected try_new to fail for alignment"),
+        }
+    }
+
+    #[test]
+    fn try_new_constructs_job_without_panicking() {
+        let job: Job<64, u32> = Job::try_new(|| 7 + 35).unwrap();
+        assert_eq!(job.run(), 42);
     }
 
     #[test]

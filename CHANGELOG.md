@@ -1,5 +1,12 @@
 # Release Notes
 
+## [0.3.0] — 2026-01-15
+
+### Improvements
+
+* Added fallible constructors `Job::try_new` and `JobInitError` so oversized or misaligned closures return structured errors instead of panicking.
+* Documented the non-panicking constructor in the README and added tests covering the new error cases.
+
 ## [0.2.0] — 2025-12-07
 
 ### ⚠️  Breaking Changes

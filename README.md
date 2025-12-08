@@ -39,7 +39,7 @@ This design is ideal for **HFT**, **real-time telemetry**, **background I/O task
 
 ```toml
 [dependencies]
-hft-jobs = "0.2"
+hft-jobs = "0.3"
 ```
 
 ## Quick Example (Thread + MPSC)
@@ -81,6 +81,26 @@ log!(tx, "Logging from thread: {}", 42);
 ```
 
 This creates a minimal, allocation-free job execution pipeline.
+
+### Fallible construction (non-panicking)
+
+`Job::new` panics if the closure does not fit in the inline buffer. For
+non-panicking construction, use `Job::try_new`, which returns
+`JobInitError::TooLarge` or `JobInitError::InsufficientAlignment`:
+
+```rust
+use hft_jobs::{Job, JobInitError};
+
+let job: Job<64, _> = Job::try_new(|| 42).expect("fits inline");
+
+match Job::<16, _>::try_new(|| [0u8; 128]) {
+    Ok(_) => unreachable!("should not fit"),
+    Err(JobInitError::TooLarge { size, capacity }) => {
+        eprintln!("closure size {} exceeds capacity {}", size, capacity);
+    }
+    Err(err) => panic!("unexpected error: {err}"),
+}
+```
 
 ### Choosing an inline capacity
 
