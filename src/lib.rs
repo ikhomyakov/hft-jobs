@@ -119,10 +119,14 @@ use std::{marker::PhantomData, mem, ptr};
 #[repr(C)]
 pub struct Job<const N: usize, R = (), C = ()> {
     data: Align16<[u8; N]>, // N must be >= sizeof(biggest closure)
-    fn_call: unsafe fn(*mut u8, C) -> R,
+
+    // `fn_call` is really `unsafe fn(*mut u8, C) -> R`, but we need to outsmart borrow checker when, for example C is &mut T
+    fn_call: unsafe fn(*mut u8),
+
     fn_clone: unsafe fn(*const u8, *mut u8),
     fn_drop: unsafe fn(*mut u8),
-    _marker: PhantomData<R>,
+    _marker1: PhantomData<R>,
+    _marker2: PhantomData<C>,
 }
 
 #[repr(align(16))]
@@ -235,11 +239,14 @@ impl<const N: usize, R, C> Job<N, R, C> {
         }
 
         let mut job = Job {
-            fn_call: fn_call::<R, C, F>,
+            fn_call: unsafe {
+                mem::transmute::<unsafe fn(*mut u8, C) -> R, unsafe fn(*mut u8)>(fn_call::<R, C, F>)
+            },
             fn_clone: fn_clone::<R, C, F>,
             fn_drop: fn_drop::<R, C, F>,
             data: Align16([0u8; N]),
-            _marker: PhantomData,
+            _marker1: PhantomData,
+            _marker2: PhantomData,
         };
 
         unsafe {
@@ -305,7 +312,9 @@ impl<const N: usize, R, C> Job<N, R, C> {
         unsafe {
             // Replace drop with a no-op drop (ZST panic closure) to avoid double-drop.
             self.fn_drop = Job::<N, R, C>::default().fn_drop;
-            (self.fn_call)(self.data.0.as_ptr() as *mut u8, ctx)
+            let fn_call =
+                mem::transmute::<unsafe fn(*mut u8), unsafe fn(*mut u8, C) -> R>(self.fn_call);
+            fn_call(self.data.0.as_ptr() as *mut u8, ctx)
         }
     }
 }
@@ -336,7 +345,8 @@ impl<const N: usize, R, C> Clone for Job<N, R, C> {
             fn_clone: self.fn_clone,
             fn_drop: self.fn_drop,
             data: Align16([0u8; N]),
-            _marker: PhantomData,
+            _marker1: PhantomData,
+            _marker2: PhantomData,
         };
         unsafe {
             (self.fn_clone)(self.data.0.as_ptr(), new_job.data.0.as_mut_ptr());
@@ -602,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn job_runs_with_mutable_context() {
+    fn job_runs_with_mutable_context_aka_spooky_action() {
         #[derive(Default, Clone)]
         struct Ctx {
             ticks: u32,
@@ -617,12 +627,12 @@ mod tests {
 
         let job_clone = job.clone();
 
-        let first = job.run_with_ctx(&mut ctx);
+        let first = job_clone.run_with_ctx(&mut ctx);
 
         assert_eq!(first, 1);
-        assert_eq!(ctx.ticks, 1);
+        assert_eq!(ctx.ticks, 1); // Without transmuting fn_call, this gets entangled with &mut
 
-        let second = job_clone.run_with_ctx(&mut ctx);
+        let second = job.run_with_ctx(&mut ctx);
         assert_eq!(second, 2);
         assert_eq!(ctx.ticks, 2);
     }
