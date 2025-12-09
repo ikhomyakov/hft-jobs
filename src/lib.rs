@@ -119,7 +119,7 @@ use std::{marker::PhantomData, mem, ptr};
 #[repr(C)]
 pub struct Job<const N: usize, R = (), C = ()> {
     data: Align16<[u8; N]>, // N must be >= sizeof(biggest closure)
-    fn_call: unsafe fn(*mut u8, C) -> R,
+    fn_call: unsafe fn(*mut u8, &mut C) -> R,
     fn_clone: unsafe fn(*const u8, *mut u8),
     fn_drop: unsafe fn(*mut u8),
     _marker: PhantomData<R>,
@@ -128,7 +128,7 @@ pub struct Job<const N: usize, R = (), C = ()> {
 #[repr(align(16))]
 struct Align16<T>(pub T);
 
-// SAFETY: Job only ever contains F: FnOnce(C) -> R + Clone + Send + 'static,
+// SAFETY: Job only ever contains F: FnOnce(&mut C) -> R + Clone + Send + 'static,
 // enforced in Job::new_with_ctx / Job::new, so it is safe to move between threads.
 unsafe impl<const N: usize, R, C> Send for Job<N, R, C> {}
 
@@ -182,7 +182,7 @@ impl<const N: usize, R, C> Job<N, R, C> {
     ///     sum: u32,
     /// }
     ///
-    /// let job = Job::<64, u32, &mut Ctx>::new_with_ctx(|ctx| {
+    /// let job = Job::<64, u32, Ctx>::new_with_ctx(|ctx| {
     ///     ctx.sum += 1;
     ///     ctx.sum
     /// });
@@ -192,11 +192,10 @@ impl<const N: usize, R, C> Job<N, R, C> {
     /// assert_eq!(ctx.sum, 1);
     /// ```
     ///
-    /// F: FnOnce(C) -> R + Clone + Send + 'static
-    #[inline]
+    /// F: FnOnce(&mut C) -> R + Clone + Send + 'static
     pub fn new_with_ctx<F>(f: F) -> Self
     where
-        F: FnOnce(C) -> R + Clone + Send + 'static,
+        F: FnOnce(&mut C) -> R + Clone + Send + 'static,
     {
         // Ensure (at compile time) that the closure fits into our inline storage
         const {
@@ -204,9 +203,9 @@ impl<const N: usize, R, C> Job<N, R, C> {
             assert!(mem::align_of::<F>() <= mem::align_of::<Align16<[u8; N]>>());
         }
 
-        unsafe fn fn_call<R, C, F>(data: *mut u8, ctx: C) -> R
+        unsafe fn fn_call<R, C, F>(data: *mut u8, ctx: &mut C) -> R
         where
-            F: FnOnce(C) -> R,
+            F: FnOnce(&mut C) -> R,
         {
             unsafe {
                 let f = ptr::read(data as *const F);
@@ -216,7 +215,7 @@ impl<const N: usize, R, C> Job<N, R, C> {
 
         unsafe fn fn_clone<R, C, F>(src: *const u8, dst: *mut u8)
         where
-            F: FnOnce(C) -> R + Clone,
+            F: FnOnce(&mut C) -> R + Clone,
         {
             unsafe {
                 let f_src = &*(src as *const F);
@@ -227,7 +226,7 @@ impl<const N: usize, R, C> Job<N, R, C> {
 
         unsafe fn fn_drop<R, C, F>(data: *mut u8)
         where
-            F: FnOnce(C) -> R,
+            F: FnOnce(&mut C) -> R,
         {
             unsafe {
                 ptr::drop_in_place(data as *mut F);
@@ -291,7 +290,7 @@ impl<const N: usize, R, C> Job<N, R, C> {
     ///     total: u32,
     /// }
     ///
-    /// let job = Job::<64, u32, &mut Ctx>::new_with_ctx(|ctx| {
+    /// let job = Job::<64, u32, Ctx>::new_with_ctx(|ctx| {
     ///     ctx.total += 2;
     ///     ctx.total
     /// });
@@ -300,8 +299,7 @@ impl<const N: usize, R, C> Job<N, R, C> {
     /// assert_eq!(job.run_with_ctx(&mut ctx), 2);
     /// assert_eq!(ctx.total, 2);
     /// ```
-    #[inline]
-    pub fn run_with_ctx(mut self, ctx: C) -> R {
+    pub fn run_with_ctx(mut self, ctx: &mut C) -> R {
         unsafe {
             // Replace drop with a no-op drop (ZST panic closure) to avoid double-drop.
             self.fn_drop = Job::<N, R, C>::default().fn_drop;
@@ -317,10 +315,9 @@ impl<const N: usize, R, C> Default for Job<N, R, C> {
     /// default-constructed job will panic with the message
     /// `"attempt to execute an empty job"`.
     /// Used as a source of a no-op drop function after `run_with_ctx`.
-    #[inline]
     fn default() -> Self {
         // ZST closure; drop is effectively a no-op.
-        Self::new_with_ctx(|_ctx: C| panic!("attempt to execute an empty job"))
+        Self::new_with_ctx(|_ctx: &mut C| panic!("attempt to execute an empty job"))
     }
 }
 
@@ -329,7 +326,6 @@ impl<const N: usize, R, C> Clone for Job<N, R, C> {
     ///
     /// Both the original and cloned `Job` instances own independent copies of
     /// the captured environment and can be run separately.
-    #[inline]
     fn clone(&self) -> Self {
         let mut new_job = Job {
             fn_call: self.fn_call,
@@ -352,7 +348,6 @@ impl<const N: usize, R, C> Drop for Job<N, R, C> {
     /// the stored closure. If the job **has** been run, [`Job::run_with_ctx`]
     /// (or [`Job::run`] for the `C = ()` convenience impl) ensures that
     /// `fn_drop` has been replaced so that no double-drop occurs.
-    #[inline]
     fn drop(&mut self) {
         unsafe {
             (self.fn_drop)(self.data.0.as_mut_ptr());
@@ -366,22 +361,20 @@ impl<const N: usize, R> Job<N, R, ()> {
     ///
     /// Equivalent to [`Job::new_with_ctx`] with `C = ()`.
     /// Backwards-compatible constructor: closure takes no arguments.
-    #[inline]
     pub fn new<F>(f: F) -> Self
     where
         F: FnOnce() -> R + Clone + Send + 'static,
     {
         // Wrap zero-arg closure into a context-taking closure
-        Self::new_with_ctx(move |_ctx: ()| f())
+        Self::new_with_ctx(move |_ctx: &mut ()| f())
     }
 
     /// Convenience runner for `C = ()`.
     ///
     /// Equivalent to [`Job::run_with_ctx`] with an empty context.
     /// Backwards-compatible runner: no context required.
-    #[inline]
     pub fn run(self) -> R {
-        self.run_with_ctx(())
+        self.run_with_ctx(&mut ())
     }
 }
 
@@ -610,7 +603,7 @@ mod tests {
 
         let mut ctx = Ctx::default();
 
-        let job = Job::<64, u32, &mut Ctx>::new_with_ctx(|c| {
+        let job = Job::<64, u32, Ctx>::new_with_ctx(|c| {
             c.ticks += 1;
             c.ticks
         });
@@ -618,7 +611,6 @@ mod tests {
         let job_clone = job.clone();
 
         let first = job_clone.run_with_ctx(&mut ctx);
-
         assert_eq!(first, 1);
         assert_eq!(ctx.ticks, 1);
 
