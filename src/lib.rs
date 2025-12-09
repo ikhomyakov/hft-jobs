@@ -193,6 +193,7 @@ impl<const N: usize, R, C> Job<N, R, C> {
     /// ```
     ///
     /// F: FnOnce(&mut C) -> R + Clone + Send + 'static
+    #[inline]
     pub fn new_with_ctx<F>(f: F) -> Self
     where
         F: FnOnce(&mut C) -> R + Clone + Send + 'static,
@@ -299,6 +300,7 @@ impl<const N: usize, R, C> Job<N, R, C> {
     /// assert_eq!(job.run_with_ctx(&mut ctx), 2);
     /// assert_eq!(ctx.total, 2);
     /// ```
+    #[inline]
     pub fn run_with_ctx(mut self, ctx: &mut C) -> R {
         unsafe {
             // Replace drop with a no-op drop (ZST panic closure) to avoid double-drop.
@@ -315,6 +317,7 @@ impl<const N: usize, R, C> Default for Job<N, R, C> {
     /// default-constructed job will panic with the message
     /// `"attempt to execute an empty job"`.
     /// Used as a source of a no-op drop function after `run_with_ctx`.
+    #[inline]
     fn default() -> Self {
         // ZST closure; drop is effectively a no-op.
         Self::new_with_ctx(|_ctx: &mut C| panic!("attempt to execute an empty job"))
@@ -326,6 +329,7 @@ impl<const N: usize, R, C> Clone for Job<N, R, C> {
     ///
     /// Both the original and cloned `Job` instances own independent copies of
     /// the captured environment and can be run separately.
+    #[inline]
     fn clone(&self) -> Self {
         let mut new_job = Job {
             fn_call: self.fn_call,
@@ -348,6 +352,7 @@ impl<const N: usize, R, C> Drop for Job<N, R, C> {
     /// the stored closure. If the job **has** been run, [`Job::run_with_ctx`]
     /// (or [`Job::run`] for the `C = ()` convenience impl) ensures that
     /// `fn_drop` has been replaced so that no double-drop occurs.
+    #[inline]
     fn drop(&mut self) {
         unsafe {
             (self.fn_drop)(self.data.0.as_mut_ptr());
@@ -361,6 +366,7 @@ impl<const N: usize, R> Job<N, R, ()> {
     ///
     /// Equivalent to [`Job::new_with_ctx`] with `C = ()`.
     /// Backwards-compatible constructor: closure takes no arguments.
+    #[inline]
     pub fn new<F>(f: F) -> Self
     where
         F: FnOnce() -> R + Clone + Send + 'static,
@@ -373,6 +379,7 @@ impl<const N: usize, R> Job<N, R, ()> {
     ///
     /// Equivalent to [`Job::run_with_ctx`] with an empty context.
     /// Backwards-compatible runner: no context required.
+    #[inline]
     pub fn run(self) -> R {
         self.run_with_ctx(&mut ())
     }

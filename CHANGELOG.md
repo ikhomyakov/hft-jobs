@@ -4,8 +4,13 @@
 
 ### Improvements
 
-* Added optional context support via `Job<N, R, C>` with `new_with_ctx` and `run_with_ctx`, plus `new`/`run` conveniences for `C = ()`.
-* Documented the context API in README and crate docs, including examples and a unit test.
+* Generalized `Job` over optional execution context `C`: `Job<N, R = (), C = ()>`. Introduced methods `new_with_ctx<F>(f: F) -> Self` and `run_with_ctx(self, ctx: &mut C) -> R`. The existing `new` and `run` methods remain available as conveniences for the common case `C = ()`. This enhancement allows jobs to receive external execution context at the call site.
+
+* Expanded documentation for the new context API, including runnable examples and a dedicated unit test.
+
+* Optimization: closure size and alignment are now validated at compile time rather than runtime, reducing overhead and catching configuration issues earlier.
+
+* Optimization: Applied inline declarations to `Job` methods to enhance performance and reduce function call overhead.
 
 ## [0.2.0] — 2025-12-07
 
