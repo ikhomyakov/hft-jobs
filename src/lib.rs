@@ -617,12 +617,12 @@ mod tests {
 
         let job_clone = job.clone();
 
-        let first = job.run_with_ctx(&mut ctx);
+        let first = job_clone.run_with_ctx(&mut ctx);
 
         assert_eq!(first, 1);
         assert_eq!(ctx.ticks, 1);
 
-        let second = job_clone.run_with_ctx(&mut ctx);
+        let second = job.run_with_ctx(&mut ctx);
         assert_eq!(second, 2);
         assert_eq!(ctx.ticks, 2);
     }
