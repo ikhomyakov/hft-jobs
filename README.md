@@ -19,7 +19,8 @@ Suitable for **thread-to-thread work queues**, **background logging**, **task di
 * Designed for **real-time logging**, **job queues**, and **worker thread dispatch**
 * Thread-safe (`Send` requirement for jobs)
 * Compatible with **SPMC**, **MPSC**, and thread-pool patterns
-* Explicit inline capacity via const generic (`Job<N, R>`), so you size storage for your largest capture
+* Explicit inline capacity via const generic (`Job<N, R, C>`), so you size storage for your largest capture
+* Optional mutable context (`C`, default `()`), passed to jobs at execution time via `run_with_ctx`
 * Return type is generic (`R`, defaulting to `()`), so jobs can either be fire-and-forget or yield a value
 
 ## Latency Characteristics
@@ -39,7 +40,7 @@ This design is ideal for **HFT**, **real-time telemetry**, **background I/O task
 
 ```toml
 [dependencies]
-hft-jobs = "0.2"
+hft-jobs = "0.2.1"
 ```
 
 ## Quick Example (Thread + MPSC)
@@ -50,8 +51,8 @@ use std::thread;
 use hft_jobs::Job;
 
 // Create a simple channel for dispatching jobs to a worker.
-// `Job<N, R>` now requires an explicit inline capacity; 64 bytes works well
-// for small captures.
+// `Job<N, R, C>` now requires an explicit inline capacity; 64 bytes works well
+// for small captures. `C` defaults to `()`.
 let (tx, rx) = mpsc::channel::<Job<64, String>>();
 
 // Spawn the worker thread
@@ -84,17 +85,43 @@ This creates a minimal, allocation-free job execution pipeline.
 
 ### Choosing an inline capacity
 
-`Job<N, R>` requires an explicit inline buffer size `N`. Pick a value large enough
+`Job<N, R, C>` requires an explicit inline buffer size `N`. Pick a value large enough
 for your biggest closure capture:
 
 - `64` bytes works for most lightweight logging/telemetry closures.
 - Larger captures (e.g., big structs or arrays) may need `128` or `256`.
 - Oversizing is cheap (storage is inline) and fixed at compile time.
 
+### Context-aware jobs
+
+Jobs can receive a mutable context at execution time via the third generic parameter `C` and the `run_with_ctx` API. The zero-context case (`C = ()`) still works with the familiar `new`/`run` helpers.
+
+```rust
+use hft_jobs::Job;
+
+#[derive(Default)]
+struct Context {
+    total: u32,
+}
+
+let mut ctx = Context::default();
+
+let job = Job::<64, u32, Context>::new_with_ctx(|c| {
+    c.total += 1;
+    c.total
+});
+
+assert_eq!(job.run_with_ctx(&mut ctx), 1);
+assert_eq!(ctx.total, 1);
+```
+
+You can still use `Job::<N, R>::new` and `run` when no context is needed.
+
 ### Generic parameters
 
 - `N`: inline buffer size in bytes (must be provided). Choose a capacity that fits your largest closure capture.
 - `R`: return type of the stored closure. Defaults to `()`, so you only specify it when you need to return a value (e.g., `Job<64, String>`).
+- `C`: mutable context type passed to the closure when running. Defaults to `()`. Use `run_with_ctx` when `C` is non-`()`; otherwise `run` is available for the zero-context case.
 
 ## Design Overview
 
