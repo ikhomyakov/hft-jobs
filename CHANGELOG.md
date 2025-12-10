@@ -1,5 +1,12 @@
 # Release Notes
 
+## [0.3.1] — 2025-12-09
+
+### Improvements
+
+* Inline storage automatically pads to the captured closure’s alignment (no fixed 16-byte cap) and fails at compile time if the padded size would exceed `N`.
+* Faster run path: post-execution drop handler is now a static no-op function instead of constructing a default job.
+
 ## [0.3.0] — 2025-12-08
 
 ### Improvements
