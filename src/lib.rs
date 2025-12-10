@@ -52,6 +52,21 @@
 
 use std::{marker::PhantomData, mem, ptr};
 
+#[inline(always)]
+fn padding_for<F>(data: *const u8) -> usize {
+    let align = mem::align_of::<F>();
+    debug_assert!(align.is_power_of_two());
+    let base = data as usize;
+    let aligned = (base + (align - 1)) & !(align - 1);
+    aligned - base
+}
+
+#[inline(always)]
+unsafe fn data_ptr<F>(data: *mut u8) -> *mut F {
+    let offset = padding_for::<F>(data as *const u8);
+    unsafe { data.add(offset) as *mut F }
+}
+
 /// A type-erased, fixed-size job container for storing and invoking closures.
 ///
 /// `Job` holds an opaque buffer and a trio of function pointers that know how
@@ -200,8 +215,11 @@ impl<const N: usize, R, C> Job<N, R, C> {
     {
         // Ensure (at compile time) that the closure fits into our inline storage
         const {
-            assert!(mem::size_of::<F>() <= N);
-            assert!(mem::align_of::<F>() <= mem::align_of::<Align16<[u8; N]>>());
+            let align = mem::align_of::<F>();
+            let base_align = mem::align_of::<Align16<[u8; N]>>();
+            let padding = (align.wrapping_sub(base_align % align)) % align;
+            let required = padding + mem::size_of::<F>();
+            assert!(required <= N);
         }
 
         unsafe fn fn_call<R, C, F>(data: *mut u8, ctx: &mut C) -> R
@@ -209,7 +227,7 @@ impl<const N: usize, R, C> Job<N, R, C> {
             F: FnOnce(&mut C) -> R,
         {
             unsafe {
-                let f = ptr::read(data as *const F);
+                let f = ptr::read(data_ptr::<F>(data));
                 f(ctx)
             }
         }
@@ -219,9 +237,9 @@ impl<const N: usize, R, C> Job<N, R, C> {
             F: FnOnce(&mut C) -> R + Clone,
         {
             unsafe {
-                let f_src = &*(src as *const F);
+                let f_src = &*data_ptr::<F>(src as *mut u8);
                 let f_clone = f_src.clone();
-                ptr::write(dst as *mut F, f_clone);
+                ptr::write(data_ptr::<F>(dst), f_clone);
             }
         }
 
@@ -230,7 +248,7 @@ impl<const N: usize, R, C> Job<N, R, C> {
             F: FnOnce(&mut C) -> R,
         {
             unsafe {
-                ptr::drop_in_place(data as *mut F);
+                ptr::drop_in_place(data_ptr::<F>(data));
             }
         }
 
@@ -244,7 +262,15 @@ impl<const N: usize, R, C> Job<N, R, C> {
 
         unsafe {
             // Place the closure into `data` without heap allocation
-            let dst = job.data.0.as_mut_ptr() as *mut F;
+            let base = job.data.0.as_mut_ptr();
+            let padding = padding_for::<F>(base as *const u8);
+            let required = padding + mem::size_of::<F>();
+            debug_assert!(
+                required <= N,
+                "closure does not fit in inline storage: requires {required} bytes with alignment {}, but capacity is {N}",
+                mem::align_of::<F>(),
+            );
+            let dst = base.add(padding) as *mut F;
             ptr::write(dst, f);
         }
 
@@ -302,9 +328,12 @@ impl<const N: usize, R, C> Job<N, R, C> {
     /// ```
     #[inline]
     pub fn run_with_ctx(mut self, ctx: &mut C) -> R {
+        #[inline(always)]
+        unsafe fn drop_noop(_data: *mut u8) {}
+
         unsafe {
             // Replace drop with a no-op drop (ZST panic closure) to avoid double-drop.
-            self.fn_drop = Job::<N, R, C>::default().fn_drop;
+            self.fn_drop = drop_noop;
             (self.fn_call)(self.data.0.as_ptr() as *mut u8, ctx)
         }
     }
@@ -545,6 +574,17 @@ mod tests {
         // Should not panic:
         let job: Job<64, ()> = Job::new(c);
         job.run();
+    }
+
+    #[test]
+    fn job_handles_high_alignment_closure() {
+        #[repr(align(64))]
+        #[derive(Clone)]
+        struct Aligned(u64);
+
+        let captured = Aligned(7);
+        let job: Job<128, u64> = Job::new(move || captured.0 * 6);
+        assert_eq!(job.run(), 42);
     }
 
     #[test]

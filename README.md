@@ -40,7 +40,7 @@ This design is ideal for **HFT**, **real-time telemetry**, **background I/O task
 
 ```toml
 [dependencies]
-hft-jobs = "0.2.1"
+hft-jobs = "0.3.1"
 ```
 
 ## Quick Example (Thread + MPSC)
